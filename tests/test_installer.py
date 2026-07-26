@@ -134,6 +134,152 @@ class TestSanitizeLocalConfig(unittest.TestCase):
         iop.sanitize_local_config()  # must not raise
 
 
+class TestConfigureSmallModel(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf
+        self._tmp = Path(_tf.mkdtemp())
+        import shutil as _sh
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_json_path = self._tmp / "opencode.json"
+        self.fake_jsonc_path = self._tmp / "opencode.jsonc"
+        self._patch_json = mock.patch.object(iop, "GLOBAL_CONFIG_JSON", self.fake_json_path)
+        self._patch_jsonc = mock.patch.object(iop, "GLOBAL_CONFIG_JSONC", self.fake_jsonc_path)
+        self._patch_json.start()
+        self._patch_jsonc.start()
+        self.addCleanup(self._patch_json.stop)
+        self.addCleanup(self._patch_jsonc.stop)
+        # Use non-dry-run for tests
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def test_sets_on_empty_config(self):
+        self.assertFalse(self.fake_json_path.exists())
+        iop.configure_small_model()
+        cfg = json.loads(self.fake_json_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["small_model"], iop.SMALL_MODEL)
+
+    def test_idempotent(self):
+        self.fake_json_path.write_text(
+            json.dumps({"small_model": iop.SMALL_MODEL}), encoding="utf-8"
+        )
+        mtime = self.fake_json_path.stat().st_mtime_ns
+        iop.configure_small_model()
+        self.assertEqual(self.fake_json_path.stat().st_mtime_ns, mtime,
+                         "file rewritten despite identical value")
+
+    def test_updates_existing(self):
+        self.fake_json_path.write_text(
+            json.dumps({"small_model": "old/model"}), encoding="utf-8"
+        )
+        iop.configure_small_model()
+        cfg = json.loads(self.fake_json_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["small_model"], iop.SMALL_MODEL)
+
+    def test_prefers_json_over_jsonc(self):
+        self.fake_json_path.write_text("{}", encoding="utf-8")
+        self.fake_jsonc_path.write_text("{}", encoding="utf-8")
+        iop.configure_small_model()
+        cfg = json.loads(self.fake_json_path.read_text(encoding="utf-8"))
+        self.assertIn("small_model", cfg)
+        cfg2 = json.loads(self.fake_jsonc_path.read_text(encoding="utf-8"))
+        self.assertNotIn("small_model", cfg2,
+                         "should write to .json when both exist")
+
+    def test_handles_invalid_json_without_crash(self):
+        self.fake_json_path.write_text("not json", encoding="utf-8")
+        iop.configure_small_model()  # must not raise
+
+
+class TestInstallCompactionPlugin(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf
+        self._tmp = Path(_tf.mkdtemp())
+        import shutil as _sh
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_ts = self._tmp / "compaction.ts"
+        self.fake_json = self._tmp / "opencode.json"
+        self._patch_ts = mock.patch.object(iop, "COMPACTION_PLUGIN", self.fake_ts)
+        self._patch_json = mock.patch.object(iop, "GLOBAL_CONFIG_JSON", self.fake_json)
+        self._patch_jsonc = mock.patch.object(iop, "GLOBAL_CONFIG_JSONC",
+                                               self._tmp / "opencode.jsonc")
+        self._patch_ts.start()
+        self._patch_json.start()
+        self._patch_jsonc.start()
+        self.addCleanup(self._patch_ts.stop)
+        self.addCleanup(self._patch_json.stop)
+        self.addCleanup(self._patch_jsonc.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def test_writes_ts_file(self):
+        iop.install_compaction_plugin()
+        self.assertTrue(self.fake_ts.exists())
+        content = self.fake_ts.read_text(encoding="utf-8")
+        self.assertIn("experimental.session.compacting", content)
+
+    def test_adds_plugin_entry(self):
+        self.fake_json.write_text(
+            json.dumps({"plugin": ["opencode-rtk@latest"]}), encoding="utf-8"
+        )
+        iop.install_compaction_plugin()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertIn(iop.COMPACTION_PLUGIN_ENTRY, cfg["plugin"])
+        # should be at front
+        self.assertEqual(cfg["plugin"][0], iop.COMPACTION_PLUGIN_ENTRY)
+
+    def test_idempotent_no_duplicate_entry(self):
+        self.fake_json.write_text(
+            json.dumps({"plugin": [iop.COMPACTION_PLUGIN_ENTRY]}), encoding="utf-8"
+        )
+        iop.install_compaction_plugin()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["plugin"].count(iop.COMPACTION_PLUGIN_ENTRY), 1)
+
+    def test_creates_config_if_missing(self):
+        self.assertFalse(self.fake_json.exists())
+        iop.install_compaction_plugin()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertIn(iop.COMPACTION_PLUGIN_ENTRY, cfg.get("plugin", []))
+
+
+class TestInstallConciseAgentsMd(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf
+        self._tmp = Path(_tf.mkdtemp())
+        import shutil as _sh
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_agents_md = self._tmp / "AGENTS.md"
+        self._patch = mock.patch.object(iop, "AGENTS_MD", self.fake_agents_md)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def test_writes_content(self):
+        iop.install_concise_agents_md()
+        self.assertTrue(self.fake_agents_md.exists())
+        content = self.fake_agents_md.read_text(encoding="utf-8")
+        self.assertIn("MUST keep replies short", content)
+        self.assertEqual(content, iop.read_text(iop.AGENTS_MD_SRC))
+
+    def test_backups_existing_before_overwrite(self):
+        self.fake_agents_md.write_text("old content", encoding="utf-8")
+        iop.install_concise_agents_md()
+        backups = sorted(self._tmp.glob("AGENTS.md.*.bak"))
+        self.assertEqual(len(backups), 1, "should create one backup")
+        self.assertIn("old content", backups[0].read_text(encoding="utf-8"))
+
+    def test_idempotent_no_backup_when_unchanged(self):
+        iop.install_concise_agents_md()
+        first_mtime = self.fake_agents_md.stat().st_mtime_ns
+        iop.install_concise_agents_md()
+        self.assertEqual(self.fake_agents_md.stat().st_mtime_ns, first_mtime,
+                         "file rewritten despite identical content")
+
+
 class TestDefaultBranch(unittest.TestCase):
     def test_parses_symbolic_ref(self):
         fake = "/tmp/fake-repo"
@@ -177,105 +323,73 @@ class _AgentFixtures(unittest.TestCase):
         self.addCleanup(self._patch.stop)
 
 
-class TestStripCavemanModelPins(_AgentFixtures):
-    def test_strips_model_line(self):
-        f = self.agents_dir / "cavecrew-builder.md"
-        f.write_text(
-            "---\n"
-            "name: cavecrew-builder\n"
-            "model: github-copilot/gpt-5.4\n"
-            "description: builder\n"
-            "---\n"
-            "Body text.\n",
-            encoding="utf-8",
-        )
-        iop.strip_caveman_model_pins()
-        text = f.read_text(encoding="utf-8")
-        self.assertNotIn("model:", text)
-        self.assertIn("name: cavecrew-builder", text)
-        self.assertIn("description: builder", text)
-        self.assertIn("Body text.", text)
+class TestConfigureAgentOptimizations(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf, shutil as _sh
+        self._tmp = Path(_tf.mkdtemp())
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_json = self._tmp / "opencode.json"
+        self._patch_json = mock.patch.object(iop, "GLOBAL_CONFIG_JSON", self.fake_json)
+        self._patch_jsonc = mock.patch.object(iop, "GLOBAL_CONFIG_JSONC",
+                                               self._tmp / "opencode.jsonc")
+        self._patch_json.start()
+        self._patch_jsonc.start()
+        self.addCleanup(self._patch_json.stop)
+        self.addCleanup(self._patch_jsonc.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
 
-    def test_no_op_when_clean(self):
-        f = self.agents_dir / "cavecrew-builder.md"
-        f.write_text(
-            "---\nname: cavecrew-builder\ndescription: builder\n---\nBody.\n",
-            encoding="utf-8",
-        )
-        iop.strip_caveman_model_pins()
-        # no print assert; just no exception and file unchanged
-        self.assertIn("name: cavecrew-builder", f.read_text(encoding="utf-8"))
+    def test_writes_agent_block(self):
+        iop.configure_agent_optimizations()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertIn("agent", cfg)
+        self.assertEqual(cfg["agent"]["plan"]["model"], "openrouter/z-ai/glm-5.2")
+        self.assertEqual(cfg["agent"]["explore"]["steps"], 15)
 
-    def test_leaves_non_frontmatter_model_line(self):
-        f = self.agents_dir / "cavecrew-builder.md"
-        f.write_text(
-            "---\nname: cavecrew-builder\n---\n"
-            "In body: model: keep-me\n",
-            encoding="utf-8",
-        )
-        iop.strip_caveman_model_pins()
-        self.assertIn("In body: model: keep-me", f.read_text(encoding="utf-8"))
+    def test_idempotent(self):
+        iop.configure_agent_optimizations()
+        mtime = self.fake_json.stat().st_mtime_ns
+        iop.configure_agent_optimizations()
+        self.assertEqual(self.fake_json.stat().st_mtime_ns, mtime)
 
-    def test_ignores_non_cavecrew_files(self):
-        f = self.agents_dir / "other.md"
-        f.write_text(
-            "---\nname: other\nmodel: x\n---\n", encoding="utf-8"
-        )
-        iop.strip_caveman_model_pins()
-        self.assertIn("model: x", f.read_text(encoding="utf-8"))
+    def test_creates_config_if_missing(self):
+        self.assertFalse(self.fake_json.exists())
+        iop.configure_agent_optimizations()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["agent"]["plan"]["model"], "openrouter/z-ai/glm-5.2")
+
+    def test_handles_invalid_json_without_crash(self):
+        self.fake_json.write_text("not json", encoding="utf-8")
+        iop.configure_agent_optimizations()
 
 
-class TestStripSuperpowersModelPins(_AgentFixtures):
-    def test_strips_primary(self):
-        f = self.agents_dir / "superpowers.md"
-        f.write_text(
-            "---\n"
-            "name: superpowers\n"
-            "model: github-copilot/gpt-5.4-mini\n"
-            "mode: primary\n"
-            "---\n",
-            encoding="utf-8",
-        )
-        iop.strip_superpowers_model_pins()
-        text = f.read_text(encoding="utf-8")
-        self.assertNotIn("model:", text)
-        self.assertIn("mode: primary", text)
-
-    def test_strips_subagents(self):
-        for name, pin in [
-            ("superpowers-code-reviewer.md", "github-copilot/gpt-5.4"),
-            ("superpowers-implementer.md", "github-copilot/claude-sonnet-4.6"),
-            ("superpowers-plan-writer.md", "anthropic/claude-opus-4-7"),
-            ("superpowers-spec-writer.md", "github-copilot/gpt-5.5"),
-        ]:
-            (self.agents_dir / name).write_text(
-                f"---\nname: {name[:-3]}\nmodel: {pin}\nmode: subagent\n---\n",
-                encoding="utf-8",
-            )
-        iop.strip_superpowers_model_pins()
+class TestRemoveSuperpowersAgents(_AgentFixtures):
+    def test_removes_all_superpowers(self):
         for name in [
-            "superpowers-code-reviewer.md",
-            "superpowers-implementer.md",
-            "superpowers-plan-writer.md",
+            "superpowers.md", "superpowers-code-reviewer.md",
+            "superpowers-implementer.md", "superpowers-plan-writer.md",
             "superpowers-spec-writer.md",
         ]:
-            self.assertNotIn(
-                "model:", (self.agents_dir / name).read_text(encoding="utf-8")
-            )
+            (self.agents_dir / name).write_text("---\nname: test\n---\n", encoding="utf-8")
+        iop.remove_superpowers_agents()
+        remaining = list(self.agents_dir.glob("superpowers*.md"))
+        self.assertEqual(remaining, [])
+
+    def test_preserves_non_superpowers(self):
+        (self.agents_dir / "superpowers.md").write_text("---\nname: test\n---\n", encoding="utf-8")
+        (self.agents_dir / "my-agent.md").write_text("---\nname: mine\n---\n", encoding="utf-8")
+        iop.remove_superpowers_agents()
+        remaining = sorted(f.name for f in self.agents_dir.glob("*.md"))
+        self.assertEqual(remaining, ["my-agent.md"])
 
     def test_no_op_when_clean(self):
-        f = self.agents_dir / "superpowers.md"
-        f.write_text(
-            "---\nname: superpowers\nmode: primary\n---\n", encoding="utf-8"
-        )
-        iop.strip_superpowers_model_pins()
-        self.assertNotIn("model:", f.read_text(encoding="utf-8"))
+        iop.remove_superpowers_agents()  # no crash
 
-    def test_handles_missing_agents_dir(self):
+    def test_handles_missing_dir(self):
         import shutil as _sh
         _sh.rmtree(self.agents_dir)
-        # should not raise
-        iop.strip_superpowers_model_pins()
+        iop.remove_superpowers_agents()  # no crash
 
 
 if __name__ == "__main__":

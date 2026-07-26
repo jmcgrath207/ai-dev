@@ -4,21 +4,32 @@ Installer + utility scripts for an opencode + Superpowers + rtk dev setup.
 
 ## `install-opencode-plugins.py`
 
-Idempotent installer that sets up:
+Idempotent installer that sets up (source files in `config/`):
 
 - the **rtk** binary at `~/.local/bin/rtk` (with `~/.local/bin` added to
   `PATH` for the current process so subsequent steps can find it)
 - the **rtk** config in `~/.config/rtk/` and a `PreToolUse` hook in
   `~/.claude/settings.json` (for Claude Code)
 - the **opencode plugins**: `opencode-rtk`, `context-mode`, `@tarquinen/opencode-dcp`
+- the **compaction context plugin** (`~/.config/opencode/plugins/compaction.ts`)
+  — injects a preservation checklist into native compaction summaries
+- **`small_model`** set to `openrouter/deepseek/deepseek-v4-flash` in global
+  config — cheap model for title generation and other lightweight tasks
 - the **Superpowers agent pack** (`opencode-superpowers@latest` via `npx`)
-  — with all upstream `model:` frontmatter pins stripped so the agents
-  use the user's configured default model instead of the upstream's
-  Copilot pins
-- the **caveman** agent pack (`JuliusBrussee/caveman`) — with its
-  `model:` pins stripped the same way
+  — the superpowers **agent files** are deleted immediately after install;
+  only the bundled **skills** are kept (skills are invokable independently
+  from any primary agent via the `skill` tool)
+- **per-agent model/temperature/steps** set in global config — `plan` gets
+  `openrouter/z-ai/glm-5.2` (cheaper model, low temp, 30-step cap),
+  `explore`/`scout` get `openrouter/deepseek/deepseek-v4-flash` with
+  15/20 step caps, `general` gets 25-step cap, `build` gets balanced
+  temperature
+- the **concise output rule** in `~/.config/opencode/AGENTS.md` — keeps
+  responses concise by default unless the user asks for more detail
 - the **rust-skills** and **golang-skills** opencode skill packs (cloned
   into `~/.config/opencode/skills/`, default-branch aware)
+- **caveman / cavecrew cleanup** — removes JuliusBrussee/caveman artifacts
+  (plugin, skills, commands, agents) from the system on each install/update
 - a sanitize pass on `~/.opencode/opencode.json` to strip a known-bogus
   `"list"` entry left by an older opencode bug
 
@@ -48,19 +59,22 @@ Idempotent installer that sets up:
 | `~/.claude/settings.json` | `PreToolUse` rtk hook installed (backed up) |
 | `~/.opencode/opencode.json` | sanitized; bogus `"list"` entry removed (backed up) |
 | `~/.config/opencode/opencode.jsonc` | plugin list updated (backed up) |
-| `~/.config/opencode/agents/superpowers*.md` | installed; `model:` pins stripped |
-| `~/.config/opencode/agents/cavecrew-*.md` | installed; `model:` pins stripped |
+| `~/.config/opencode/opencode.json` | small_model set, agent config set, compaction plugin entry added (backed up) |
+| `~/.config/opencode/plugins/compaction.ts` | written / updated |
+| `~/.config/opencode/AGENTS.md` | concise output rule installed (backed up) |
+| `~/.config/opencode/agents/superpowers*.md` | installed then **deleted** (skills kept) |
 | `~/.config/opencode/skills/rust-skills/` | cloned / updated |
 | `~/.config/opencode/skills/golang-skills/` | cloned / updated |
+| caveman/cavecrew artifacts | deleted (plugin, skills, commands, agents) |
 
 Backups are written alongside each file as `<name>.<TS>.bak`; the newest
 **5** are kept per target (older ones are deleted automatically).
 
 ### Security
 
-The installer pipes remote shell scripts (`rtk`, `caveman`) from pinned
-GitHub raw URLs into a shell. URLs are declared as constants near the
-top of the file — review them before running, or run `--dry-run` first
+The installer pipes a remote shell script (`rtk`) from a pinned
+GitHub raw URL into a shell. The URL is declared as a constant near the
+top of the file — review it before running, or run `--dry-run` first
 to see exactly what commands would execute.
 
 ### Tests

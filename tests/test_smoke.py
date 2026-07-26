@@ -45,10 +45,13 @@ class TestDryRun(unittest.TestCase):
                 "install_rtk_hook",
                 "sanitize_local_config",
                 "install_plugins",
+                "install_compaction_plugin",
+                "configure_small_model",
+                "configure_agent_optimizations",
                 "install_superpowers",
-                "strip_superpowers_model_pins",
-                "install_julius_caveman",
-                "strip_caveman_model_pins",
+                "remove_superpowers_agents",
+                "remove_caveman_artifacts",
+                "install_concise_agents_md",
                 "install_rust_skills",
                 "install_golang_skills",
             ]
@@ -101,13 +104,19 @@ class TestDryRun(unittest.TestCase):
                 ), mock.patch.object(
                     iop, "install_plugins", proxies["install_plugins"]
                 ), mock.patch.object(
+                    iop, "install_compaction_plugin", proxies["install_compaction_plugin"]
+                ), mock.patch.object(
+                    iop, "configure_small_model", proxies["configure_small_model"]
+                ), mock.patch.object(
+                    iop, "configure_agent_optimizations", proxies["configure_agent_optimizations"]
+                ), mock.patch.object(
                     iop, "install_superpowers", proxies["install_superpowers"]
                 ), mock.patch.object(
-                    iop, "strip_superpowers_model_pins", proxies["strip_superpowers_model_pins"]
+                    iop, "remove_superpowers_agents", proxies["remove_superpowers_agents"]
                 ), mock.patch.object(
-                    iop, "install_julius_caveman", proxies["install_julius_caveman"]
+                    iop, "remove_caveman_artifacts", proxies["remove_caveman_artifacts"]
                 ), mock.patch.object(
-                    iop, "strip_caveman_model_pins", proxies["strip_caveman_model_pins"]
+                    iop, "install_concise_agents_md", proxies["install_concise_agents_md"]
                 ), mock.patch.object(
                     iop, "install_rust_skills", proxies["install_rust_skills"]
                 ), mock.patch.object(
@@ -122,17 +131,10 @@ class TestDryRun(unittest.TestCase):
         for name, proxy in proxies.items():
             self.assertIn(name, called, f"step {name} not invoked")
 
-        # The strip_superpowers_model_pins step must be called AFTER
-        # install_superpowers and BEFORE install_julius_caveman
-        # (matches the documented order; the superpowers pack is the one
-        # that drops the copilot model pins).
+        # remove_superpowers_agents must be called AFTER install_superpowers
         self.assertLess(
             called.index("install_superpowers"),
-            called.index("strip_superpowers_model_pins"),
-        )
-        self.assertLess(
-            called.index("strip_superpowers_model_pins"),
-            called.index("install_julius_caveman"),
+            called.index("remove_superpowers_agents"),
         )
 
     def test_dry_run_output_mentions_dry_run(self):
@@ -150,8 +152,10 @@ class TestDryRun(unittest.TestCase):
                 for name in [
                     "backup_configs", "install_rtk_binary", "rtk_init_opencode",
                     "install_rtk_hook", "sanitize_local_config", "install_plugins",
-                    "install_superpowers", "strip_superpowers_model_pins",
-                    "install_julius_caveman", "strip_caveman_model_pins",
+                    "install_compaction_plugin", "configure_small_model",
+                    "configure_agent_optimizations",
+                    "install_superpowers", "remove_superpowers_agents",
+                    "remove_caveman_artifacts", "install_concise_agents_md",
                     "install_rust_skills", "install_golang_skills",
                 ]:
                     mock.patch.object(iop, name, lambda *a, **kw: None).start()
