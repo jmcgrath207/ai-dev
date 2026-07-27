@@ -344,8 +344,11 @@ class TestConfigureAgentOptimizations(unittest.TestCase):
         iop.configure_agent_optimizations()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
         self.assertIn("agent", cfg)
-        self.assertEqual(cfg["agent"]["plan"]["model"], "openrouter/z-ai/glm-5.2")
+        self.assertEqual(cfg["agent"]["plan"]["temperature"], 0.1)
+        self.assertEqual(cfg["agent"]["plan"]["steps"], 30)
         self.assertEqual(cfg["agent"]["explore"]["steps"], 15)
+        self.assertEqual(cfg["agent"]["plan"]["model"], iop.AGENT_CONFIG["plan"]["model"])
+        self.assertEqual(cfg["agent"]["explore"]["model"], iop.AGENT_CONFIG["explore"]["model"])
 
     def test_idempotent(self):
         iop.configure_agent_optimizations()
@@ -357,7 +360,8 @@ class TestConfigureAgentOptimizations(unittest.TestCase):
         self.assertFalse(self.fake_json.exists())
         iop.configure_agent_optimizations()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
-        self.assertEqual(cfg["agent"]["plan"]["model"], "openrouter/z-ai/glm-5.2")
+        self.assertIn("agent", cfg)
+        self.assertEqual(cfg["agent"]["plan"]["model"], iop.AGENT_CONFIG["plan"]["model"])
 
     def test_handles_invalid_json_without_crash(self):
         self.fake_json.write_text("not json", encoding="utf-8")
@@ -673,6 +677,83 @@ class TestRemoveOpenrouterRoutingCron(unittest.TestCase):
     def test_skips_when_no_crontab(self):
         with mock.patch.object(iop, "check_cmd", return_value=False):
             iop.remove_openrouter_routing_cron()
+
+
+class TestConfigureDcpLimits(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf, shutil as _sh
+        self._tmp = Path(_tf.mkdtemp())
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_dcp = self._tmp / "dcp.jsonc"
+        self._patch = mock.patch.object(iop, "DCP_CONFIG", self.fake_dcp)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def _assert_limits(self, cfg):
+        comp = cfg["compress"]
+        self.assertEqual(comp["maxContextLimit"], "60%")
+        self.assertEqual(comp["minContextLimit"], "30%")
+
+    def test_writes_limits(self):
+        iop.configure_dcp_limits()
+        cfg = json.loads(self.fake_dcp.read_text(encoding="utf-8"))
+        self._assert_limits(cfg)
+        self.assertEqual(
+            cfg.get("$schema"),
+            iop.DCP_SCHEMA,
+        )
+
+    def test_idempotent(self):
+        iop.configure_dcp_limits()
+        mtime = self.fake_dcp.stat().st_mtime_ns
+        iop.configure_dcp_limits()
+        self.assertEqual(self.fake_dcp.stat().st_mtime_ns, mtime)
+        cfg = json.loads(self.fake_dcp.read_text(encoding="utf-8"))
+        self._assert_limits(cfg)
+
+    def test_creates_config_if_missing(self):
+        self.assertFalse(self.fake_dcp.exists())
+        iop.configure_dcp_limits()
+        cfg = json.loads(self.fake_dcp.read_text(encoding="utf-8"))
+        self._assert_limits(cfg)
+
+    def test_handles_invalid_json_without_crash(self):
+        self.fake_dcp.write_text("not json", encoding="utf-8")
+        iop.configure_dcp_limits()
+
+    def test_preserves_existing_settings(self):
+        self.fake_dcp.write_text(
+            json.dumps({
+                "$schema": iop.DCP_SCHEMA,
+                "enabled": False,
+                "debug": True,
+            }),
+            encoding="utf-8",
+        )
+        iop.configure_dcp_limits()
+        cfg = json.loads(self.fake_dcp.read_text(encoding="utf-8"))
+        self._assert_limits(cfg)
+        self.assertEqual(cfg["enabled"], False)
+        self.assertEqual(cfg["debug"], True)
+
+    def test_preserves_existing_compress_keys(self):
+        self.fake_dcp.write_text(
+            json.dumps({
+                "compress": {
+                    "mode": "message",
+                    "showCompression": True,
+                },
+            }),
+            encoding="utf-8",
+        )
+        iop.configure_dcp_limits()
+        cfg = json.loads(self.fake_dcp.read_text(encoding="utf-8"))
+        self._assert_limits(cfg)
+        self.assertEqual(cfg["compress"]["mode"], "message")
+        self.assertEqual(cfg["compress"]["showCompression"], True)
 
 
 if __name__ == "__main__":

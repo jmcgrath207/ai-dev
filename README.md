@@ -15,22 +15,30 @@ Idempotent installer that sets up (source files in `config/`):
 - the **opencode plugins**: `opencode-rtk`, `context-mode`, `@tarquinen/opencode-dcp`
 - the **compaction context plugin** (`~/.config/opencode/plugins/compaction.ts`)
   — injects a preservation checklist into native compaction summaries
-- **`small_model`** set to `openrouter/deepseek/deepseek-v4-flash` in global
+- the **cheap-route plugin** (`~/.config/opencode/plugins/cheap-route.ts`)
+  — virtual `cheap_route` provider that resolves logical model names to cheapest
+  direct vendor at session start (via `config` + `chat.message` hooks). Ranks
+  vendors from models.dev, sticky per session; `/cheap-route refresh` updates
+  with y/yes confirmation. See `config/plugins/cheap-route.ts`.
+- **`small_model`** set to `cheap-route/deepseek-v4-flash` in global
   config — cheap model for title generation and other lightweight tasks
 - the **Superpowers agent pack** (`opencode-superpowers@latest` via `npx`)
   — the superpowers **agent files** are deleted immediately after install;
   only the bundled **skills** are kept (skills are invokable independently
   from any primary agent via the `skill` tool)
 - **per-agent model/temperature/steps** set in global config — `plan` gets
-  `openrouter/z-ai/glm-5.2` (cheaper model, low temp, 30-step cap),
-  `explore`/`scout` get `openrouter/deepseek/deepseek-v4-flash` with
+  `cheap-route/glm-5.2` (cheap model, low temp, 30-step cap),
+  `explore`/`scout` get `cheap-route/deepseek-v4-flash` with
   15/20 step caps, `general` gets 25-step cap, `build` gets balanced
   temperature
 - **OpenRouter timeouts + sort-by-price routing** — client timeouts
   (`timeout` 120s, `headerTimeout` 15s, `chunkTimeout` 45s) plus per-model
   `provider.sort: {by: price}` (z-ai/glm-5.2, deepseek/deepseek-v4-flash,
-  moonshotai/kimi-k3). No `order` list so OpenRouter sticky routing can pin
-  the session upstream (opencode sends `prompt_cache_key` / `X-Session-Id`).
+moonshotai/kimi-k3, minimax/minimax-m3). No `order` list so OpenRouter sticky routing can pin
+   the session upstream (opencode sends `prompt_cache_key` / `X-Session-Id`).
+- **DCP context limit thresholds** — `compress.maxContextLimit` set to `"60%"`
+  and `minContextLimit` to `"30%"` of each model's context window in
+  `~/.config/opencode/dcp.jsonc` (percentage values adapt per model)
 
 - the **concise output rule** in `~/.config/opencode/AGENTS.md` — keeps
   responses concise by default unless the user asks for more detail
@@ -73,7 +81,10 @@ Idempotent installer that sets up (source files in `config/`):
 | `~/.opencode/opencode.json` | sanitized; bogus `"list"` entry removed (backed up) |
 | `~/.config/opencode/opencode.jsonc` | plugin list updated (backed up) |
 | `~/.config/opencode/opencode.json` | small_model, agent config, OpenRouter timeouts + sort-by-price routing, compaction plugin entry (backed up) |
+| `~/.config/opencode/dcp.jsonc` | DCP compress limits (maxContextLimit=60%, minContextLimit=30%) (backed up) |
 | `~/.config/opencode/plugins/compaction.ts` | written / updated |
+| `~/.config/opencode/plugins/cheap-route.ts` | installed (virtual provider + vendor routing) |
+| `~/.cache/cheap-route/resolution.json` | vendor resolution cache (created on `/cheap-route refresh`) |
 | `~/.config/opencode/AGENTS.md` | concise output rule installed (backed up) |
 | `~/.config/opencode/agents/superpowers*.md` | installed then **deleted** (skills kept) |
 | `~/.config/opencode/skills/rust-skills/` | cloned / updated |

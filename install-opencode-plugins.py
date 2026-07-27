@@ -54,8 +54,18 @@ OPENROUTER_ROUTING_MODELS = [
     "z-ai/glm-5.2",
     "deepseek/deepseek-v4-flash",
     "moonshotai/kimi-k3",
+    "minimax/minimax-m3",
 ]
 OPENROUTER_CRON_MARKER = "ai-dev-openrouter-routing"  # legacy; removed on install
+
+# DCP plugin config — written to ~/.config/opencode/dcp.jsonc.
+# Percentage values adapt to each model's context window automatically.
+DCP_CONFIG = HOME / ".config" / "opencode" / "dcp.jsonc"
+DCP_SCHEMA = "https://raw.githubusercontent.com/Opencode-DCP/opencode-dynamic-context-pruning/master/dcp.schema.json"
+DCP_COMPRESS_LIMITS = {
+    "maxContextLimit": "60%",
+    "minContextLimit": "30%",
+}
 
 AGENT_CONFIG = {
     "plan": {
@@ -96,6 +106,14 @@ export const CompactionContextPlugin: Plugin = async () => {
   }
 }
 '''
+
+# cheap-route plugin — DISABLED for dev (re-enable when ready to iterate).
+# CHEAP_ROUTE_PLUGIN_SRC = _HERE / "config" / "plugins" / "cheap-route.ts"
+# CHEAP_ROUTE_PLUGIN = HOME / ".config" / "opencode" / "plugins" / "cheap-route.ts"
+# CHEAP_ROUTE_PLUGIN_ENTRY = "./plugins/cheap-route.ts"
+# CHEAP_ROUTE_LIB_SRC = _HERE / "config" / "plugins" / "cheap-route-lib.ts"
+# CHEAP_ROUTE_LIB = HOME / ".config" / "opencode" / "plugins" / "cheap-route-lib.ts"
+
 AST_GREP_BIN = RTK_BIN_DIR / "sg"
 AST_GREP_SKILL_REPO = "https://github.com/ast-grep/agent-skill.git"
 AST_GREP_SKILL_CACHE = HOME / ".cache/ast-grep-skill-repo"
@@ -540,6 +558,11 @@ def install_compaction_plugin() -> None:
     print(f"  added {COMPACTION_PLUGIN_ENTRY} to {cfg_path.name} plugin list")
 
 
+def install_cheap_route_plugin() -> None:
+    """Cheap-route plugin — DISABLED for dev iteration."""
+    log("installing cheap-route plugin — DISABLED (dev)"); return
+
+
 def configure_small_model() -> None:
     log("configuring small_model for lightweight tasks")
     cfg_path = global_config_path()
@@ -669,6 +692,51 @@ def configure_openrouter_routing() -> None:
         f"chunkTimeout={OPENROUTER_PROVIDER_OPTIONS['chunkTimeout']}ms"
     )
     print(f"  sort-by-price on {len(OPENROUTER_ROUTING_MODELS)} models (sticky-friendly)")
+
+
+def configure_dcp_limits() -> None:
+    """Set DCP context limit thresholds to match modern model context windows."""
+    log("configuring DCP compress limits")
+    cfg_path = DCP_CONFIG
+
+    if not cfg_path.exists():
+        cfg = {"$schema": DCP_SCHEMA}
+    else:
+        try:
+            cfg = json.loads(read_text(cfg_path))
+        except json.JSONDecodeError:
+            warn(f"{cfg_path} invalid JSON — cannot configure DCP limits")
+            return
+        if not isinstance(cfg, dict):
+            warn(f"{cfg_path} is not a JSON object — skip")
+            return
+
+    current_compress = cfg.get("compress", {})
+    if not isinstance(current_compress, dict):
+        current_compress = {}
+
+    if (
+        current_compress.get("maxContextLimit") == DCP_COMPRESS_LIMITS["maxContextLimit"]
+        and current_compress.get("minContextLimit") == DCP_COMPRESS_LIMITS["minContextLimit"]
+    ):
+        print("  DCP compress limits already configured")
+        return
+
+    # Preserve any existing keys, merge our limits
+    cfg["compress"] = {**current_compress, **DCP_COMPRESS_LIMITS}
+
+    if _dry_run:
+        print("  dry-run: would write DCP compress limits")
+        return
+
+    if cfg_path.exists():
+        backup_with_rotation(cfg_path)
+    atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+    _touched.append(cfg_path)
+    print(
+        f"  maxContextLimit={DCP_COMPRESS_LIMITS['maxContextLimit']} "
+        f"minContextLimit={DCP_COMPRESS_LIMITS['minContextLimit']}"
+    )
 
 
 def remove_openrouter_routing_cron() -> None:
@@ -921,6 +989,8 @@ def verify() -> None:
             print(f"  agent.explore.model: {explore_model}")
             has_compaction = COMPACTION_PLUGIN_ENTRY in cfg.get("plugin", [])
             print(f"  compaction plugin entry: {'yes' if has_compaction else 'MISSING'}")
+            # has_cheap_route = CHEAP_ROUTE_PLUGIN_ENTRY in cfg.get("plugin", [])
+            # print(f"  cheap-route plugin entry: {'yes' if has_cheap_route else 'MISSING'}")
             provider_cfg = cfg.get("provider", {})
             or_block = provider_cfg.get("openrouter", {})
             or_opts = or_block.get("options", {}) if isinstance(or_block, dict) else {}
@@ -936,6 +1006,20 @@ def verify() -> None:
                 )
                 short = mid.split("/")[-1]
                 print(f"  openrouter {short} routing: {prov}")
+            dcp_cfg_path = DCP_CONFIG
+            if dcp_cfg_path.exists():
+                try:
+                    dcp_cfg = json.loads(read_text(dcp_cfg_path))
+                    dcp_compress = dcp_cfg.get("compress", {})
+                    if isinstance(dcp_compress, dict):
+                        print(f"  dcp maxContextLimit: {dcp_compress.get('maxContextLimit', 'not set')}")
+                        print(f"  dcp minContextLimit: {dcp_compress.get('minContextLimit', 'not set')}")
+                    else:
+                        print("  dcp compress: not an object")
+                except (json.JSONDecodeError, OSError):
+                    warn(f"could not read {dcp_cfg_path.name}")
+            else:
+                warn("dcp config not found")
         except (json.JSONDecodeError, OSError):
             warn(f"could not read {cfg_path}")
     else:
@@ -945,6 +1029,16 @@ def verify() -> None:
     else:
         warn(f"compaction plugin file {COMPACTION_PLUGIN.name} not found")
     print()
+    # cheap-route install disabled for dev
+    # if CHEAP_ROUTE_PLUGIN.exists():
+    #     print(f"  cheap-route plugin: installed ({CHEAP_ROUTE_PLUGIN.stat().st_size} bytes)")
+    # else:
+    #     warn("cheap-route plugin not found")
+    # if CHEAP_ROUTE_LIB.exists():
+    #     print(f"  cheap-route lib: installed ({CHEAP_ROUTE_LIB.stat().st_size} bytes)")
+    # else:
+    #     warn("cheap-route lib not found")
+    # print()
     if AGENTS_MD.exists():
         print(f"  AGENTS.md: installed ({AGENTS_MD.stat().st_size} bytes)")
     else:
@@ -1046,9 +1140,11 @@ def main(argv: list[str] | None = None) -> int:
         ("sanitize_local_config", sanitize_local_config),
         ("install_plugins", install_plugins),
         ("install_compaction_plugin", install_compaction_plugin),
+        # ("install_cheap_route_plugin", install_cheap_route_plugin),  # disabled for dev
         ("configure_small_model", configure_small_model),
         ("configure_agent_optimizations", configure_agent_optimizations),
         ("configure_openrouter_routing", configure_openrouter_routing),
+        ("configure_dcp_limits", configure_dcp_limits),
         ("remove_openrouter_routing_cron", remove_openrouter_routing_cron),
         ("install_superpowers", install_superpowers),
         ("remove_superpowers_agents", remove_superpowers_agents),
