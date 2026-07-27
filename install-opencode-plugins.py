@@ -46,15 +46,16 @@ OPENROUTER_PROVIDER_OPTIONS = {
     "chunkTimeout": 45_000,   # max gap between SSE chunks (ms)
 }
 
-# OpenRouter request-body routing — MUST be set per-model, not at provider level.
-# Provider-level "options" are treated as AI SDK constructor params and the
-# "provider" sub-key never reaches the request body.
+# OpenRouter request-body routing — MUST be set per-model (provider-level is ignored).
+# sort-by-price disables load balancing; omit `order` so OpenRouter sticky routing works
+# (opencode already sends prompt_cache_key / X-Session-Id = session id).
 OPENROUTER_ROUTING = {"sort": {"by": "price"}}
 OPENROUTER_ROUTING_MODELS = [
     "z-ai/glm-5.2",
     "deepseek/deepseek-v4-flash",
     "moonshotai/kimi-k3",
 ]
+OPENROUTER_CRON_MARKER = "ai-dev-openrouter-routing"  # legacy; removed on install
 
 AGENT_CONFIG = {
     "plan": {
@@ -594,13 +595,15 @@ def configure_agent_optimizations() -> None:
 
 
 def configure_openrouter_routing() -> None:
-    log("configuring OpenRouter timeouts + per-model routing (sort by price)")
+    """Set OpenRouter client timeouts + per-model sort-by-price routing."""
+    log("configuring OpenRouter timeouts + sort-by-price routing")
     cfg_path = global_config_path()
+
     if cfg_path.exists():
         try:
             cfg = json.loads(read_text(cfg_path))
         except json.JSONDecodeError:
-            warn(f"{cfg_path} invalid JSON — cannot set OpenRouter routing")
+            warn(f"{cfg_path} invalid JSON — cannot configure OpenRouter")
             return
     else:
         cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
@@ -612,56 +615,100 @@ def configure_openrouter_routing() -> None:
     if not isinstance(openrouter, dict):
         openrouter = {}
 
-    # Provider-level options: timeouts only (SDK-level, no "provider" sub-key).
     current_opts = openrouter.get("options", {})
     if not isinstance(current_opts, dict):
         current_opts = {}
-    # Strip any "provider" key that was mistakenly set at provider level.
+    # Drop legacy provider-level routing (ignored by opencode / AI SDK).
     clean_opts = {k: v for k, v in current_opts.items() if k != "provider"}
     merged_opts = {**clean_opts, **OPENROUTER_PROVIDER_OPTIONS}
 
-    # Model-level options: routing per model.
     current_models = openrouter.get("models", {})
     if not isinstance(current_models, dict):
         current_models = {}
-    models_changed = False
+    new_models = dict(current_models)
     for model_id in OPENROUTER_ROUTING_MODELS:
-        entry = current_models.get(model_id, {})
+        entry = new_models.get(model_id, {})
         if not isinstance(entry, dict):
             entry = {}
         entry_opts = entry.get("options", {})
         if not isinstance(entry_opts, dict):
             entry_opts = {}
-        if entry_opts.get("provider") == OPENROUTER_ROUTING:
-            continue  # already correct
-        entry_opts = {**entry_opts, "provider": OPENROUTER_ROUTING}
-        current_models[model_id] = {**entry, "options": entry_opts}
-        models_changed = True
+        entry_opts = {**entry_opts, "provider": dict(OPENROUTER_ROUTING)}
+        new_models[model_id] = {**entry, "options": entry_opts}
 
-    # Check if already configured (no changes needed).
-    provider_opts_ok = (
+    timeouts_ok = (
         all(current_opts.get(k) == v for k, v in OPENROUTER_PROVIDER_OPTIONS.items())
         and "provider" not in current_opts
     )
-    if provider_opts_ok and not models_changed:
-        print("  OpenRouter timeouts + routing already configured")
+    models_ok = all(
+        isinstance(new_models.get(mid), dict)
+        and isinstance(new_models[mid].get("options"), dict)
+        and new_models[mid]["options"].get("provider") == OPENROUTER_ROUTING
+        and isinstance(current_models.get(mid), dict)
+        and isinstance(current_models[mid].get("options"), dict)
+        and current_models[mid]["options"].get("provider") == OPENROUTER_ROUTING
+        for mid in OPENROUTER_ROUTING_MODELS
+    )
+    if timeouts_ok and models_ok:
+        print("  OpenRouter timeouts + sort-by-price already configured")
         return
 
-    openrouter = {**openrouter, "options": merged_opts, "models": current_models}
+    openrouter = {**openrouter, "options": merged_opts, "models": new_models}
     providers = {**providers, "openrouter": openrouter}
     cfg["provider"] = providers
-    if not _dry_run:
-        if cfg_path.exists():
-            backup_with_rotation(cfg_path)
-        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
-        _touched.append(cfg_path)
+    if _dry_run:
+        print("  dry-run: would write OpenRouter timeouts + sort-by-price")
+        return
+    if cfg_path.exists():
+        backup_with_rotation(cfg_path)
+    atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+    _touched.append(cfg_path)
     print(
         f"  set timeout={OPENROUTER_PROVIDER_OPTIONS['timeout']}ms "
         f"headerTimeout={OPENROUTER_PROVIDER_OPTIONS['headerTimeout']}ms "
-        f"chunkTimeout={OPENROUTER_PROVIDER_OPTIONS['chunkTimeout']}ms "
-        f"sort=price on {len(OPENROUTER_ROUTING_MODELS)} models"
+        f"chunkTimeout={OPENROUTER_PROVIDER_OPTIONS['chunkTimeout']}ms"
     )
+    print(f"  sort-by-price on {len(OPENROUTER_ROUTING_MODELS)} models (sticky-friendly)")
 
+
+def remove_openrouter_routing_cron() -> None:
+    """Remove legacy hourly update-openrouter-routing.py crontab entry if present."""
+    log("removing legacy OpenRouter routing cron (if any)")
+    if not check_cmd("crontab"):
+        print("  crontab not found — skip")
+        return
+    try:
+        result = subprocess.run(
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        print("  crontab not found — skip")
+        return
+    existing = result.stdout if result.returncode == 0 else ""
+    if OPENROUTER_CRON_MARKER not in existing:
+        print("  no legacy OpenRouter routing cron")
+        return
+    lines = [ln for ln in existing.splitlines() if OPENROUTER_CRON_MARKER not in ln]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    new_table = ("\n".join(lines) + "\n") if lines else ""
+    if _dry_run:
+        print("  dry-run: would remove OpenRouter routing cron")
+        return
+    proc = subprocess.run(
+        ["crontab", "-"],
+        input=new_table,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        warn(f"crontab update failed: {proc.stderr.strip() or proc.returncode}")
+        return
+    print("  removed legacy OpenRouter routing cron")
 
 def install_superpowers() -> None:
     if not check_cmd("npx"):
@@ -875,15 +922,20 @@ def verify() -> None:
             has_compaction = COMPACTION_PLUGIN_ENTRY in cfg.get("plugin", [])
             print(f"  compaction plugin entry: {'yes' if has_compaction else 'MISSING'}")
             provider_cfg = cfg.get("provider", {})
-            or_opts = provider_cfg.get("openrouter", {}).get("options", {})
-            or_routing = or_opts.get("provider", {})
+            or_block = provider_cfg.get("openrouter", {})
+            or_opts = or_block.get("options", {}) if isinstance(or_block, dict) else {}
+            or_models = or_block.get("models", {}) if isinstance(or_block, dict) else {}
             print(f"  openrouter timeout: {or_opts.get('timeout', 'not set')}")
             print(f"  openrouter chunkTimeout: {or_opts.get('chunkTimeout', 'not set')}")
-            print(f"  openrouter sort: {or_routing.get('sort', 'not set')}")
-            print(
-                f"  openrouter preferred_max_latency: "
-                f"{or_routing.get('preferred_max_latency', 'not set')}"
-            )
+            for mid in OPENROUTER_ROUTING_MODELS:
+                entry = or_models.get(mid, {}) if isinstance(or_models, dict) else {}
+                prov = (
+                    entry.get("options", {}).get("provider", "not set")
+                    if isinstance(entry, dict)
+                    else "not set"
+                )
+                short = mid.split("/")[-1]
+                print(f"  openrouter {short} routing: {prov}")
         except (json.JSONDecodeError, OSError):
             warn(f"could not read {cfg_path}")
     else:
@@ -997,6 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
         ("configure_small_model", configure_small_model),
         ("configure_agent_optimizations", configure_agent_optimizations),
         ("configure_openrouter_routing", configure_openrouter_routing),
+        ("remove_openrouter_routing_cron", remove_openrouter_routing_cron),
         ("install_superpowers", install_superpowers),
         ("remove_superpowers_agents", remove_superpowers_agents),
         ("remove_caveman_artifacts", remove_caveman_artifacts),

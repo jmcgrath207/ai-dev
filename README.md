@@ -26,10 +26,12 @@ Idempotent installer that sets up (source files in `config/`):
   `explore`/`scout` get `openrouter/deepseek/deepseek-v4-flash` with
   15/20 step caps, `general` gets 25-step cap, `build` gets balanced
   temperature
-- **OpenRouter timeouts + per-model routing** — client timeouts
-  (`timeout` 120s, `headerTimeout` 15s, `chunkTimeout` 45s) plus
-  `sort: { by: "price" }` applied per-model (z-ai/glm-5.2,
-  deepseek/deepseek-v4-flash, moonshotai/kimi-k3)
+- **OpenRouter timeouts + sort-by-price routing** — client timeouts
+  (`timeout` 120s, `headerTimeout` 15s, `chunkTimeout` 45s) plus per-model
+  `provider.sort: {by: price}` (z-ai/glm-5.2, deepseek/deepseek-v4-flash,
+  moonshotai/kimi-k3). No `order` list so OpenRouter sticky routing can pin
+  the session upstream (opencode sends `prompt_cache_key` / `X-Session-Id`).
+
 - the **concise output rule** in `~/.config/opencode/AGENTS.md` — keeps
   responses concise by default unless the user asks for more detail
 - the **rust-skills** and **golang-skills** opencode skill packs (cloned
@@ -57,6 +59,7 @@ Idempotent installer that sets up (source files in `config/`):
 ./install-opencode-plugins.py --dry-run  # show what would happen
 ./install-opencode-plugins.py --help     # all flags
 ./install-opencode-plugins.py -v         # verbose: log every exec
+
 ```
 
 ### What it touches
@@ -69,7 +72,7 @@ Idempotent installer that sets up (source files in `config/`):
 | `~/.claude/settings.json` | `PreToolUse` rtk hook installed (backed up) |
 | `~/.opencode/opencode.json` | sanitized; bogus `"list"` entry removed (backed up) |
 | `~/.config/opencode/opencode.jsonc` | plugin list updated (backed up) |
-| `~/.config/opencode/opencode.json` | small_model, agent config, OpenRouter routing, compaction plugin entry (backed up) |
+| `~/.config/opencode/opencode.json` | small_model, agent config, OpenRouter timeouts + sort-by-price routing, compaction plugin entry (backed up) |
 | `~/.config/opencode/plugins/compaction.ts` | written / updated |
 | `~/.config/opencode/AGENTS.md` | concise output rule installed (backed up) |
 | `~/.config/opencode/agents/superpowers*.md` | installed then **deleted** (skills kept) |

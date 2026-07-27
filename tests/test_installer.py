@@ -522,8 +522,9 @@ class TestConfigureOpenRouterRouting(unittest.TestCase):
         self.addCleanup(_sh.rmtree, self._tmp, True)
         self.fake_json = self._tmp / "opencode.json"
         self._patch_json = mock.patch.object(iop, "GLOBAL_CONFIG_JSON", self.fake_json)
-        self._patch_jsonc = mock.patch.object(iop, "GLOBAL_CONFIG_JSONC",
-                                               self._tmp / "opencode.jsonc")
+        self._patch_jsonc = mock.patch.object(
+            iop, "GLOBAL_CONFIG_JSONC", self._tmp / "opencode.jsonc"
+        )
         self._patch_json.start()
         self._patch_jsonc.start()
         self.addCleanup(self._patch_json.stop)
@@ -532,34 +533,37 @@ class TestConfigureOpenRouterRouting(unittest.TestCase):
         self._dry.start()
         self.addCleanup(self._dry.stop)
 
-    def _assert_routing(self, cfg):
-        """Assert timeouts at provider level, routing per-model."""
+    def _assert_config(self, cfg):
         opts = cfg["provider"]["openrouter"]["options"]
         self.assertEqual(opts["timeout"], 120_000)
         self.assertEqual(opts["headerTimeout"], 15_000)
         self.assertEqual(opts["chunkTimeout"], 45_000)
-        self.assertNotIn("provider", opts)  # routing NOT at provider level
+        self.assertNotIn("provider", opts)
         models = cfg["provider"]["openrouter"]["models"]
         for mid in iop.OPENROUTER_ROUTING_MODELS:
-            self.assertIn(mid, models)
-            self.assertEqual(models[mid]["options"]["provider"], {"sort": {"by": "price"}})
+            self.assertEqual(
+                models[mid]["options"]["provider"],
+                iop.OPENROUTER_ROUTING,
+            )
 
-    def test_writes_routing_block(self):
+    def test_writes_timeouts_and_sort_by_price(self):
         iop.configure_openrouter_routing()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
-        self._assert_routing(cfg)
+        self._assert_config(cfg)
 
     def test_idempotent(self):
         iop.configure_openrouter_routing()
         mtime = self.fake_json.stat().st_mtime_ns
         iop.configure_openrouter_routing()
         self.assertEqual(self.fake_json.stat().st_mtime_ns, mtime)
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self._assert_config(cfg)
 
     def test_creates_config_if_missing(self):
         self.assertFalse(self.fake_json.exists())
         iop.configure_openrouter_routing()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
-        self._assert_routing(cfg)
+        self._assert_config(cfg)
 
     def test_handles_invalid_json_without_crash(self):
         self.fake_json.write_text("not json", encoding="utf-8")
@@ -573,7 +577,7 @@ class TestConfigureOpenRouterRouting(unittest.TestCase):
         iop.configure_openrouter_routing()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
         self.assertIn("anthropic", cfg["provider"])
-        self._assert_routing(cfg)
+        self._assert_config(cfg)
 
     def test_removes_legacy_provider_level_routing(self):
         self.fake_json.write_text(
@@ -591,8 +595,84 @@ class TestConfigureOpenRouterRouting(unittest.TestCase):
         iop.configure_openrouter_routing()
         cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
         opts = cfg["provider"]["openrouter"]["options"]
-        self.assertNotIn("provider", opts)  # stripped from provider level
-        self._assert_routing(cfg)
+        self.assertNotIn("provider", opts)
+        self._assert_config(cfg)
+
+    def test_replaces_dynamic_order_with_sort(self):
+        self.fake_json.write_text(
+            json.dumps({
+                "provider": {
+                    "openrouter": {
+                        "options": {"timeout": 120_000},
+                        "models": {
+                            "z-ai/glm-5.2": {
+                                "options": {
+                                    "provider": {
+                                        "order": ["novita", "akashml"],
+                                        "allow_fallbacks": False,
+                                        "zdr": True,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        iop.configure_openrouter_routing()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self._assert_config(cfg)
+        prov = cfg["provider"]["openrouter"]["models"]["z-ai/glm-5.2"]["options"]["provider"]
+        self.assertNotIn("order", prov)
+        self.assertNotIn("zdr", prov)
+
+
+class TestRemoveOpenrouterRoutingCron(unittest.TestCase):
+    def setUp(self):
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def test_removes_marker_lines(self):
+        existing = (
+            f"0 * * * * /usr/bin/python3 /tmp/x.py # {iop.OPENROUTER_CRON_MARKER}\n"
+            "30 * * * * /usr/bin/true\n"
+        )
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            if cmd[:2] == ["crontab", "-l"]:
+                return mock.Mock(returncode=0, stdout=existing, stderr="")
+            if cmd == ["crontab", "-"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(iop, "check_cmd", return_value=True), \
+             mock.patch.object(iop.subprocess, "run", side_effect=fake_run):
+            iop.remove_openrouter_routing_cron()
+        install = [c for c in calls if c[0] == ["crontab", "-"]]
+        self.assertEqual(len(install), 1)
+        table = install[0][1]["input"]
+        self.assertNotIn(iop.OPENROUTER_CRON_MARKER, table)
+        self.assertIn("/usr/bin/true", table)
+
+    def test_noop_when_absent(self):
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return mock.Mock(
+                    returncode=0, stdout="30 * * * * /usr/bin/true\n", stderr=""
+                )
+            raise AssertionError(f"unexpected {cmd}")
+
+        with mock.patch.object(iop, "check_cmd", return_value=True), \
+             mock.patch.object(iop.subprocess, "run", side_effect=fake_run):
+            iop.remove_openrouter_routing_cron()
+
+    def test_skips_when_no_crontab(self):
+        with mock.patch.object(iop, "check_cmd", return_value=False):
+            iop.remove_openrouter_routing_cron()
 
 
 if __name__ == "__main__":
