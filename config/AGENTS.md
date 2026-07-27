@@ -20,3 +20,9 @@ MUST keep replies short by default. Default length: 1-4 lines of prose (not coun
 - When the user explicitly asks for more detail.
 
 If unsure: stay short and offer one line they can ask to expand on.
+
+## Tool preferences
+
+For structural code search (find patterns by syntax, not text), prefer
+`ast-grep --lang <lang> -p '<pattern>'` (binary: `sg`). For complex rules,
+invoke the `ast-grep` skill.

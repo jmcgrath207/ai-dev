@@ -392,5 +392,208 @@ class TestRemoveSuperpowersAgents(_AgentFixtures):
         iop.remove_superpowers_agents()  # no crash
 
 
+class TestInstallAstGrepBinary(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf, shutil as _sh
+        self._tmp = Path(_tf.mkdtemp())
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_bin = self._tmp / "sg"
+        self._patch_bin = mock.patch.object(iop, "AST_GREP_BIN", self.fake_bin)
+        self._patch_bin.start()
+        self.addCleanup(self._patch_bin.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def test_downloads_and_installs_binary(self):
+        self.fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        self.fake_bin.write_text("", encoding="utf-8")
+        fake_sg = Path("/tmp/fake-sg")
+        fake_ast_grep = Path("/tmp/fake-ast-grep")
+        with mock.patch.object(iop.platform, "system", return_value="Linux"), \
+             mock.patch.object(iop.platform, "machine", return_value="x86_64"), \
+             mock.patch.object(iop, "check_cmd", return_value=True), \
+             mock.patch.object(iop, "run") as mock_run, \
+             mock.patch("zipfile.ZipFile") as mock_zf, \
+             mock.patch("shutil.copy2") as mock_copy, \
+             mock.patch.object(Path, "chmod"), \
+             mock.patch.object(Path, "iterdir",
+                               return_value=[fake_sg, fake_ast_grep]), \
+             mock.patch.object(Path, "is_file", return_value=True):
+            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            mock_zf.return_value.__enter__.return_value.extractall = mock.Mock()
+            iop.install_ast_grep_binary()
+            self.assertEqual(mock_copy.call_count, 2)
+
+    def test_force_reinstall_when_present(self):
+        self.fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        self.fake_bin.write_text("old", encoding="utf-8")
+        fake_sg = Path("/tmp/fake-sg")
+        fake_ast_grep = Path("/tmp/fake-ast-grep")
+        with mock.patch.object(iop.platform, "system", return_value="Linux"), \
+             mock.patch.object(iop.platform, "machine", return_value="x86_64"), \
+             mock.patch.object(iop, "check_cmd", return_value=True), \
+             mock.patch.object(iop, "run") as mock_run, \
+             mock.patch("zipfile.ZipFile") as mock_zf, \
+             mock.patch("shutil.copy2") as mock_copy, \
+             mock.patch.object(Path, "chmod"), \
+             mock.patch.object(Path, "iterdir",
+                               return_value=[fake_sg, fake_ast_grep]), \
+             mock.patch.object(Path, "is_file", return_value=True):
+            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            mock_zf.return_value.__enter__.return_value.extractall = mock.Mock()
+            iop.install_ast_grep_binary()
+            self.assertEqual(mock_copy.call_count, 2)
+
+    def test_skips_unsupported_platform(self):
+        with mock.patch.object(iop.platform, "system", return_value="Windows"), \
+             mock.patch.object(iop.platform, "machine", return_value="x86_64"):
+            iop.install_ast_grep_binary()  # no crash, no download
+
+    def test_target_triple_linux_x86_64(self):
+        self.assertEqual(iop._ast_grep_target_triple(), "x86_64-unknown-linux-gnu")
+
+    def test_target_triple_macos_arm(self):
+        with mock.patch.object(iop.platform, "system", return_value="Darwin"), \
+             mock.patch.object(iop.platform, "machine", return_value="arm64"):
+            self.assertEqual(iop._ast_grep_target_triple(), "aarch64-apple-darwin")
+
+    def test_target_triple_unsupported(self):
+        with mock.patch.object(iop.platform, "system", return_value="Unknown"), \
+             mock.patch.object(iop.platform, "machine", return_value="x86_64"):
+            self.assertIsNone(iop._ast_grep_target_triple())
+
+
+class TestInstallAstGrepSkill(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf, shutil as _sh
+        self._tmp = Path(_tf.mkdtemp())
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_cache = self._tmp / "cache"
+        self.fake_target = self._tmp / "target"
+        self._patch_cache = mock.patch.object(iop, "AST_GREP_SKILL_CACHE", self.fake_cache)
+        self._patch_target = mock.patch.object(iop, "AST_GREP_SKILL_DIR", self.fake_target)
+        self._patch_cache.start()
+        self._patch_target.start()
+        self.addCleanup(self._patch_cache.stop)
+        self.addCleanup(self._patch_target.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def _create_fake_repo(self):
+        """Create a fake cloned repo with the expected skill subtree."""
+        skill_src = self.fake_cache / "ast-grep/skills/ast-grep"
+        skill_src.mkdir(parents=True)
+        (skill_src / "SKILL.md").write_text("---\nname: ast-grep\n---\nskill content\n", encoding="utf-8")
+        ref_dir = skill_src / "references"
+        ref_dir.mkdir()
+        (ref_dir / "rule_reference.md").write_text("# rule reference\n", encoding="utf-8")
+
+    def test_installs_skill_files(self):
+        self._create_fake_repo()
+        with mock.patch.object(iop, "_fetch_or_clone") as mock_fetch:
+            mock_fetch.side_effect = lambda *a, **kw: None
+            iop.install_ast_grep_skill()
+        self.assertTrue((self.fake_target / "SKILL.md").exists())
+        self.assertTrue((self.fake_target / "references/rule_reference.md").exists())
+
+    def test_idempotent(self):
+        self._create_fake_repo()
+        with mock.patch.object(iop, "_fetch_or_clone") as mock_fetch:
+            mock_fetch.side_effect = lambda *a, **kw: None
+            iop.install_ast_grep_skill()
+            iop.install_ast_grep_skill()  # second call
+        self.assertTrue((self.fake_target / "SKILL.md").exists())
+
+    def test_creates_target_dir_if_missing(self):
+        self.assertFalse(self.fake_target.exists())
+        self._create_fake_repo()
+        with mock.patch.object(iop, "_fetch_or_clone") as mock_fetch:
+            mock_fetch.side_effect = lambda *a, **kw: None
+            iop.install_ast_grep_skill()
+        self.assertTrue(self.fake_target.exists())
+
+
+class TestConfigureOpenRouterRouting(unittest.TestCase):
+    def setUp(self):
+        import tempfile as _tf, shutil as _sh
+        self._tmp = Path(_tf.mkdtemp())
+        self.addCleanup(_sh.rmtree, self._tmp, True)
+        self.fake_json = self._tmp / "opencode.json"
+        self._patch_json = mock.patch.object(iop, "GLOBAL_CONFIG_JSON", self.fake_json)
+        self._patch_jsonc = mock.patch.object(iop, "GLOBAL_CONFIG_JSONC",
+                                               self._tmp / "opencode.jsonc")
+        self._patch_json.start()
+        self._patch_jsonc.start()
+        self.addCleanup(self._patch_json.stop)
+        self.addCleanup(self._patch_jsonc.stop)
+        self._dry = mock.patch.object(iop, "_dry_run", False)
+        self._dry.start()
+        self.addCleanup(self._dry.stop)
+
+    def _assert_routing(self, cfg):
+        """Assert timeouts at provider level, routing per-model."""
+        opts = cfg["provider"]["openrouter"]["options"]
+        self.assertEqual(opts["timeout"], 120_000)
+        self.assertEqual(opts["headerTimeout"], 15_000)
+        self.assertEqual(opts["chunkTimeout"], 45_000)
+        self.assertNotIn("provider", opts)  # routing NOT at provider level
+        models = cfg["provider"]["openrouter"]["models"]
+        for mid in iop.OPENROUTER_ROUTING_MODELS:
+            self.assertIn(mid, models)
+            self.assertEqual(models[mid]["options"]["provider"], {"sort": {"by": "price"}})
+
+    def test_writes_routing_block(self):
+        iop.configure_openrouter_routing()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self._assert_routing(cfg)
+
+    def test_idempotent(self):
+        iop.configure_openrouter_routing()
+        mtime = self.fake_json.stat().st_mtime_ns
+        iop.configure_openrouter_routing()
+        self.assertEqual(self.fake_json.stat().st_mtime_ns, mtime)
+
+    def test_creates_config_if_missing(self):
+        self.assertFalse(self.fake_json.exists())
+        iop.configure_openrouter_routing()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self._assert_routing(cfg)
+
+    def test_handles_invalid_json_without_crash(self):
+        self.fake_json.write_text("not json", encoding="utf-8")
+        iop.configure_openrouter_routing()
+
+    def test_preserves_other_providers(self):
+        self.fake_json.write_text(
+            json.dumps({"provider": {"anthropic": {"options": {"baseURL": "x"}}}}),
+            encoding="utf-8",
+        )
+        iop.configure_openrouter_routing()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        self.assertIn("anthropic", cfg["provider"])
+        self._assert_routing(cfg)
+
+    def test_removes_legacy_provider_level_routing(self):
+        self.fake_json.write_text(
+            json.dumps({
+                "provider": {
+                    "openrouter": {
+                        "options": {
+                            "provider": {"allow_fallbacks": False},
+                        },
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        iop.configure_openrouter_routing()
+        cfg = json.loads(self.fake_json.read_text(encoding="utf-8"))
+        opts = cfg["provider"]["openrouter"]["options"]
+        self.assertNotIn("provider", opts)  # stripped from provider level
+        self._assert_routing(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()

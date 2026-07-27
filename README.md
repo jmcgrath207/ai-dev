@@ -8,6 +8,8 @@ Idempotent installer that sets up (source files in `config/`):
 
 - the **rtk** binary at `~/.local/bin/rtk` (with `~/.local/bin` added to
   `PATH` for the current process so subsequent steps can find it)
+- the **ast-grep** binary (`sg`) at `~/.local/bin/sg` — force-installed from
+  GitHub releases (prebuilt, no Rust toolchain needed)
 - the **rtk** config in `~/.config/rtk/` and a `PreToolUse` hook in
   `~/.claude/settings.json` (for Claude Code)
 - the **opencode plugins**: `opencode-rtk`, `context-mode`, `@tarquinen/opencode-dcp`
@@ -24,10 +26,17 @@ Idempotent installer that sets up (source files in `config/`):
   `explore`/`scout` get `openrouter/deepseek/deepseek-v4-flash` with
   15/20 step caps, `general` gets 25-step cap, `build` gets balanced
   temperature
+- **OpenRouter timeouts + per-model routing** — client timeouts
+  (`timeout` 120s, `headerTimeout` 15s, `chunkTimeout` 45s) plus
+  `sort: { by: "price" }` applied per-model (z-ai/glm-5.2,
+  deepseek/deepseek-v4-flash, moonshotai/kimi-k3)
 - the **concise output rule** in `~/.config/opencode/AGENTS.md` — keeps
   responses concise by default unless the user asks for more detail
 - the **rust-skills** and **golang-skills** opencode skill packs (cloned
   into `~/.config/opencode/skills/`, default-branch aware)
+- the **ast-grep skill** — cloned from `ast-grep/agent-skill` into
+  `~/.config/opencode/skills/ast-grep/` (on-demand structural code search
+  via AST patterns; the `sg` binary is also installed)
 - **caveman / cavecrew cleanup** — removes JuliusBrussee/caveman artifacts
   (plugin, skills, commands, agents) from the system on each install/update
 - a sanitize pass on `~/.opencode/opencode.json` to strip a known-bogus
@@ -55,16 +64,18 @@ Idempotent installer that sets up (source files in `config/`):
 | path | action |
 | --- | --- |
 | `~/.local/bin/rtk` | installed |
+| `~/.local/bin/sg` | installed / force-upgraded from GitHub releases |
 | `~/.config/rtk/` | created; `RTK.md` relocated here from `$HOME` |
 | `~/.claude/settings.json` | `PreToolUse` rtk hook installed (backed up) |
 | `~/.opencode/opencode.json` | sanitized; bogus `"list"` entry removed (backed up) |
 | `~/.config/opencode/opencode.jsonc` | plugin list updated (backed up) |
-| `~/.config/opencode/opencode.json` | small_model set, agent config set, compaction plugin entry added (backed up) |
+| `~/.config/opencode/opencode.json` | small_model, agent config, OpenRouter routing, compaction plugin entry (backed up) |
 | `~/.config/opencode/plugins/compaction.ts` | written / updated |
 | `~/.config/opencode/AGENTS.md` | concise output rule installed (backed up) |
 | `~/.config/opencode/agents/superpowers*.md` | installed then **deleted** (skills kept) |
 | `~/.config/opencode/skills/rust-skills/` | cloned / updated |
 | `~/.config/opencode/skills/golang-skills/` | cloned / updated |
+| `~/.config/opencode/skills/ast-grep/` | cloned / updated (skill subtree) |
 | caveman/cavecrew artifacts | deleted (plugin, skills, commands, agents) |
 
 Backups are written alongside each file as `<name>.<TS>.bak`; the newest

@@ -12,11 +12,13 @@ exists for a dry-run, and --dry-run performs no mutation at all.
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -36,6 +38,23 @@ AGENTS_DIR = HOME / ".config/opencode/agents"
 AGENTS_MD = HOME / ".config/opencode/AGENTS.md"
 
 SMALL_MODEL = "openrouter/deepseek/deepseek-v4-flash"
+
+# Client-side timeouts (opencode) — set at provider level (SDK options).
+OPENROUTER_PROVIDER_OPTIONS = {
+    "timeout": 120_000,       # full request (ms)
+    "headerTimeout": 15_000,  # wait for response headers (ms)
+    "chunkTimeout": 45_000,   # max gap between SSE chunks (ms)
+}
+
+# OpenRouter request-body routing — MUST be set per-model, not at provider level.
+# Provider-level "options" are treated as AI SDK constructor params and the
+# "provider" sub-key never reaches the request body.
+OPENROUTER_ROUTING = {"sort": {"by": "price"}}
+OPENROUTER_ROUTING_MODELS = [
+    "z-ai/glm-5.2",
+    "deepseek/deepseek-v4-flash",
+    "moonshotai/kimi-k3",
+]
 
 AGENT_CONFIG = {
     "plan": {
@@ -76,6 +95,10 @@ export const CompactionContextPlugin: Plugin = async () => {
   }
 }
 '''
+AST_GREP_BIN = RTK_BIN_DIR / "sg"
+AST_GREP_SKILL_REPO = "https://github.com/ast-grep/agent-skill.git"
+AST_GREP_SKILL_CACHE = HOME / ".cache/ast-grep-skill-repo"
+AST_GREP_SKILL_DIR = HOME / ".config/opencode/skills/ast-grep"
 RTK_CONFIG_DIR = HOME / ".config/rtk"
 RTK_MD = HOME / "RTK.md"
 
@@ -305,6 +328,86 @@ def install_rtk_binary() -> None:
     print(f"  installed/upgraded: {RTK_BIN}")
 
 
+def _ast_grep_target_triple() -> str | None:
+    """Map platform to Rust target triple for ast-grep prebuilt binaries."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "linux":
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-unknown-linux-gnu"
+        if machine in ("aarch64", "arm64"):
+            return "aarch64-unknown-linux-gnu"
+    elif system == "darwin":
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-apple-darwin"
+        if machine in ("aarch64", "arm64"):
+            return "aarch64-apple-darwin"
+    return None
+
+
+def install_ast_grep_binary() -> None:
+    """Force-install ast-grep (sg) prebuilt binary from GitHub releases."""
+    triple = _ast_grep_target_triple()
+    if triple is None:
+        warn(f"unsupported platform: {platform.system()} {platform.machine()}")
+        return
+
+    if AST_GREP_BIN.exists():
+        ver = run(
+            [str(AST_GREP_BIN), "--version"], capture_output=True, text=True, check=False
+        )
+        log(f"force-upgrading ast-grep binary (currently {ver.stdout.strip() or ver.stderr.strip()})")
+    else:
+        log("installing ast-grep binary")
+
+    url = (
+        f"https://github.com/ast-grep/ast-grep/releases/latest/download/app-{triple}.zip"
+    )
+    downloader = None
+    if check_cmd("curl"):
+        downloader = "curl"
+    elif check_cmd("wget"):
+        downloader = "wget"
+    else:
+        err("curl and wget both missing on PATH")
+        sys.exit(1)
+
+    if _dry_run:
+        vlog(f"DRY-RUN: would download {url} and install to {AST_GREP_BIN}")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / "ast-grep.zip"
+        if downloader == "curl":
+            run(["curl", "-fsSL", "-o", str(zip_path), url])
+        else:
+            run(["wget", "-qO", str(zip_path), url])
+
+        extract_dir = Path(tmp) / "extracted"
+        extract_dir.mkdir()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+
+        # Copy all extracted files to ~/.local/bin/
+        # The zip contains both `sg` (wrapper) and `ast-grep` (real binary).
+        # zipfile.extractall does not preserve executable bits (mode 0o644),
+        # so chmod is applied after copy.
+        AST_GREP_BIN.parent.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for f in extract_dir.iterdir():
+            if not f.is_file():
+                continue
+            dest = AST_GREP_BIN.parent / f.name
+            shutil.copy2(f, dest)
+            dest.chmod(0o755)
+            _touched.append(dest)
+            copied += 1
+        if copied == 0:
+            err("no files found in ast-grep release zip")
+            sys.exit(1)
+    print(f"  installed/upgraded: {AST_GREP_BIN} (+ {copied - 1} companion file(s))")
+
+
 def rtk_init_opencode() -> None:
     log("initializing rtk for opencode")
     if _dry_run:
@@ -490,6 +593,76 @@ def configure_agent_optimizations() -> None:
     print(f"  set agent config{old_val}")
 
 
+def configure_openrouter_routing() -> None:
+    log("configuring OpenRouter timeouts + per-model routing (sort by price)")
+    cfg_path = global_config_path()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(read_text(cfg_path))
+        except json.JSONDecodeError:
+            warn(f"{cfg_path} invalid JSON — cannot set OpenRouter routing")
+            return
+    else:
+        cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
+
+    providers = cfg.get("provider", {})
+    if not isinstance(providers, dict):
+        providers = {}
+    openrouter = providers.get("openrouter", {})
+    if not isinstance(openrouter, dict):
+        openrouter = {}
+
+    # Provider-level options: timeouts only (SDK-level, no "provider" sub-key).
+    current_opts = openrouter.get("options", {})
+    if not isinstance(current_opts, dict):
+        current_opts = {}
+    # Strip any "provider" key that was mistakenly set at provider level.
+    clean_opts = {k: v for k, v in current_opts.items() if k != "provider"}
+    merged_opts = {**clean_opts, **OPENROUTER_PROVIDER_OPTIONS}
+
+    # Model-level options: routing per model.
+    current_models = openrouter.get("models", {})
+    if not isinstance(current_models, dict):
+        current_models = {}
+    models_changed = False
+    for model_id in OPENROUTER_ROUTING_MODELS:
+        entry = current_models.get(model_id, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        entry_opts = entry.get("options", {})
+        if not isinstance(entry_opts, dict):
+            entry_opts = {}
+        if entry_opts.get("provider") == OPENROUTER_ROUTING:
+            continue  # already correct
+        entry_opts = {**entry_opts, "provider": OPENROUTER_ROUTING}
+        current_models[model_id] = {**entry, "options": entry_opts}
+        models_changed = True
+
+    # Check if already configured (no changes needed).
+    provider_opts_ok = (
+        all(current_opts.get(k) == v for k, v in OPENROUTER_PROVIDER_OPTIONS.items())
+        and "provider" not in current_opts
+    )
+    if provider_opts_ok and not models_changed:
+        print("  OpenRouter timeouts + routing already configured")
+        return
+
+    openrouter = {**openrouter, "options": merged_opts, "models": current_models}
+    providers = {**providers, "openrouter": openrouter}
+    cfg["provider"] = providers
+    if not _dry_run:
+        if cfg_path.exists():
+            backup_with_rotation(cfg_path)
+        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+        _touched.append(cfg_path)
+    print(
+        f"  set timeout={OPENROUTER_PROVIDER_OPTIONS['timeout']}ms "
+        f"headerTimeout={OPENROUTER_PROVIDER_OPTIONS['headerTimeout']}ms "
+        f"chunkTimeout={OPENROUTER_PROVIDER_OPTIONS['chunkTimeout']}ms "
+        f"sort=price on {len(OPENROUTER_ROUTING_MODELS)} models"
+    )
+
+
 def install_superpowers() -> None:
     if not check_cmd("npx"):
         err("npx not found on PATH")
@@ -631,6 +804,26 @@ def install_golang_skills() -> None:
     _fetch_or_clone(GOLANG_SKILLS_REPO, GOLANG_SKILLS_DIR, hint="main")
 
 
+def install_ast_grep_skill() -> None:
+    """Clone ast-grep claude-skill repo and copy the skill subtree."""
+    if not check_cmd("git"):
+        err("git not found on PATH")
+        sys.exit(1)
+    log("installing ast-grep skill")
+    _fetch_or_clone(AST_GREP_SKILL_REPO, AST_GREP_SKILL_CACHE, hint="main")
+    src = AST_GREP_SKILL_CACHE / "ast-grep/skills/ast-grep"
+    if not src.exists():
+        err(f"expected skill subtree not found in cloned repo: {src}")
+        sys.exit(1)
+    if _dry_run:
+        vlog(f"DRY-RUN: would copy {src} -> {AST_GREP_SKILL_DIR}")
+        return
+    AST_GREP_SKILL_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, AST_GREP_SKILL_DIR, dirs_exist_ok=True)
+    _touched.append(AST_GREP_SKILL_DIR)
+    print(f"  installed: {AST_GREP_SKILL_DIR}")
+
+
 # ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
@@ -649,6 +842,14 @@ def verify() -> None:
             subprocess.run(["rtk", "init", "--show"])
     else:
         warn("rtk binary not found")
+    print()
+    if shutil.which("sg") or AST_GREP_BIN.exists():
+        if _dry_run:
+            print("  ast-grep: would run --version (dry-run)")
+        else:
+            subprocess.run([str(AST_GREP_BIN), "--version"])
+    else:
+        warn("ast-grep binary (sg) not found")
     print()
     if AGENTS_DIR.exists():
         agents = sorted(f.name for f in AGENTS_DIR.glob("*.md"))
@@ -673,6 +874,16 @@ def verify() -> None:
             print(f"  agent.explore.model: {explore_model}")
             has_compaction = COMPACTION_PLUGIN_ENTRY in cfg.get("plugin", [])
             print(f"  compaction plugin entry: {'yes' if has_compaction else 'MISSING'}")
+            provider_cfg = cfg.get("provider", {})
+            or_opts = provider_cfg.get("openrouter", {}).get("options", {})
+            or_routing = or_opts.get("provider", {})
+            print(f"  openrouter timeout: {or_opts.get('timeout', 'not set')}")
+            print(f"  openrouter chunkTimeout: {or_opts.get('chunkTimeout', 'not set')}")
+            print(f"  openrouter sort: {or_routing.get('sort', 'not set')}")
+            print(
+                f"  openrouter preferred_max_latency: "
+                f"{or_routing.get('preferred_max_latency', 'not set')}"
+            )
         except (json.JSONDecodeError, OSError):
             warn(f"could not read {cfg_path}")
     else:
@@ -699,6 +910,12 @@ def verify() -> None:
         print(f"  golang-skills: installed ({n_files} files, {skill_count} skills)")
     else:
         warn("golang-skills not found")
+    print()
+    ast_grep_skill_md = AST_GREP_SKILL_DIR / "SKILL.md"
+    if ast_grep_skill_md.exists():
+        print(f"  ast-grep skill: installed ({ast_grep_skill_md.stat().st_size} bytes)")
+    else:
+        warn("ast-grep skill not found")
     print()
     if CLAUDE_SETTINGS.exists():
         try:
@@ -771,6 +988,7 @@ def main(argv: list[str] | None = None) -> int:
     steps = [
         ("backup_configs", backup_configs),
         ("install_rtk_binary", install_rtk_binary),
+        ("install_ast_grep_binary", install_ast_grep_binary),
         ("rtk_init_opencode", rtk_init_opencode),
         ("install_rtk_hook", install_rtk_hook),
         ("sanitize_local_config", sanitize_local_config),
@@ -778,12 +996,14 @@ def main(argv: list[str] | None = None) -> int:
         ("install_compaction_plugin", install_compaction_plugin),
         ("configure_small_model", configure_small_model),
         ("configure_agent_optimizations", configure_agent_optimizations),
+        ("configure_openrouter_routing", configure_openrouter_routing),
         ("install_superpowers", install_superpowers),
         ("remove_superpowers_agents", remove_superpowers_agents),
         ("remove_caveman_artifacts", remove_caveman_artifacts),
         ("install_concise_agents_md", install_concise_agents_md),
         ("install_rust_skills", install_rust_skills),
         ("install_golang_skills", install_golang_skills),
+        ("install_ast_grep_skill", install_ast_grep_skill),
         ("sanitize_local_config (2nd pass)", sanitize_local_config),
     ]
 

@@ -41,6 +41,7 @@ class TestDryRun(unittest.TestCase):
             for name in [
                 "backup_configs",
                 "install_rtk_binary",
+                "install_ast_grep_binary",
                 "rtk_init_opencode",
                 "install_rtk_hook",
                 "sanitize_local_config",
@@ -48,12 +49,14 @@ class TestDryRun(unittest.TestCase):
                 "install_compaction_plugin",
                 "configure_small_model",
                 "configure_agent_optimizations",
+                "configure_openrouter_routing",
                 "install_superpowers",
                 "remove_superpowers_agents",
                 "remove_caveman_artifacts",
                 "install_concise_agents_md",
                 "install_rust_skills",
                 "install_golang_skills",
+                "install_ast_grep_skill",
             ]
         }
 
@@ -91,36 +94,26 @@ class TestDryRun(unittest.TestCase):
                 sh_mod.copy2 = lambda *a, **kw: None
                 sh_mod.move = lambda *a, **kw: None
 
-                with mock.patch.object(
-                    iop, "backup_configs", proxies["backup_configs"]
-                ), mock.patch.object(
-                    iop, "install_rtk_binary", proxies["install_rtk_binary"]
-                ), mock.patch.object(
-                    iop, "rtk_init_opencode", proxies["rtk_init_opencode"]
-                ), mock.patch.object(
-                    iop, "install_rtk_hook", proxies["install_rtk_hook"]
-                ), mock.patch.object(
-                    iop, "sanitize_local_config", proxies["sanitize_local_config"]
-                ), mock.patch.object(
-                    iop, "install_plugins", proxies["install_plugins"]
-                ), mock.patch.object(
-                    iop, "install_compaction_plugin", proxies["install_compaction_plugin"]
-                ), mock.patch.object(
-                    iop, "configure_small_model", proxies["configure_small_model"]
-                ), mock.patch.object(
-                    iop, "configure_agent_optimizations", proxies["configure_agent_optimizations"]
-                ), mock.patch.object(
-                    iop, "install_superpowers", proxies["install_superpowers"]
-                ), mock.patch.object(
-                    iop, "remove_superpowers_agents", proxies["remove_superpowers_agents"]
-                ), mock.patch.object(
-                    iop, "remove_caveman_artifacts", proxies["remove_caveman_artifacts"]
-                ), mock.patch.object(
-                    iop, "install_concise_agents_md", proxies["install_concise_agents_md"]
-                ), mock.patch.object(
-                    iop, "install_rust_skills", proxies["install_rust_skills"]
-                ), mock.patch.object(
-                    iop, "install_golang_skills", proxies["install_golang_skills"]
+                with mock.patch.multiple(
+                    iop,
+                    backup_configs=proxies["backup_configs"],
+                    install_rtk_binary=proxies["install_rtk_binary"],
+                    install_ast_grep_binary=proxies["install_ast_grep_binary"],
+                    rtk_init_opencode=proxies["rtk_init_opencode"],
+                    install_rtk_hook=proxies["install_rtk_hook"],
+                    sanitize_local_config=proxies["sanitize_local_config"],
+                    install_plugins=proxies["install_plugins"],
+                    install_compaction_plugin=proxies["install_compaction_plugin"],
+                    configure_small_model=proxies["configure_small_model"],
+                    configure_agent_optimizations=proxies["configure_agent_optimizations"],
+                    configure_openrouter_routing=proxies["configure_openrouter_routing"],
+                    install_superpowers=proxies["install_superpowers"],
+                    remove_superpowers_agents=proxies["remove_superpowers_agents"],
+                    remove_caveman_artifacts=proxies["remove_caveman_artifacts"],
+                    install_concise_agents_md=proxies["install_concise_agents_md"],
+                    install_rust_skills=proxies["install_rust_skills"],
+                    install_golang_skills=proxies["install_golang_skills"],
+                    install_ast_grep_skill=proxies["install_ast_grep_skill"],
                 ):
                     buf = io.StringIO()
                     with redirect_stdout(buf):
@@ -136,6 +129,11 @@ class TestDryRun(unittest.TestCase):
             called.index("install_superpowers"),
             called.index("remove_superpowers_agents"),
         )
+        # install_ast_grep_binary must be called BEFORE rtk_init_opencode
+        self.assertLess(
+            called.index("install_ast_grep_binary"),
+            called.index("rtk_init_opencode"),
+        )
 
     def test_dry_run_output_mentions_dry_run(self):
         import tempfile as _tf
@@ -150,13 +148,15 @@ class TestDryRun(unittest.TestCase):
                 sh_mod.move = lambda *a, **kw: None
                 # patch all steps to no-ops
                 for name in [
-                    "backup_configs", "install_rtk_binary", "rtk_init_opencode",
-                    "install_rtk_hook", "sanitize_local_config", "install_plugins",
-                    "install_compaction_plugin", "configure_small_model",
-                    "configure_agent_optimizations",
+                    "backup_configs", "install_rtk_binary", "install_ast_grep_binary",
+                    "rtk_init_opencode", "install_rtk_hook", "sanitize_local_config",
+                    "install_plugins", "install_compaction_plugin",
+                    "configure_small_model", "configure_agent_optimizations",
+                    "configure_openrouter_routing",
                     "install_superpowers", "remove_superpowers_agents",
                     "remove_caveman_artifacts", "install_concise_agents_md",
                     "install_rust_skills", "install_golang_skills",
+                    "install_ast_grep_skill",
                 ]:
                     mock.patch.object(iop, name, lambda *a, **kw: None).start()
                 buf = io.StringIO()
