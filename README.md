@@ -4,61 +4,20 @@ Installer + utility scripts for an opencode + Superpowers + rtk dev setup.
 
 ## `install-opencode-plugins.py`
 
-Idempotent installer that sets up (source files in `config/`):
+Provider-agnostic idempotent installer (source files in `config/`):
 
-- the **rtk** binary at `~/.local/bin/rtk` (with `~/.local/bin` added to
-  `PATH` for the current process so subsequent steps can find it)
-- the **ast-grep** binary (`sg`) at `~/.local/bin/sg` — force-installed from
-  GitHub releases (prebuilt, no Rust toolchain needed)
-- the **rtk** config in `~/.config/rtk/` and a `PreToolUse` hook in
-  `~/.claude/settings.json` (for Claude Code)
-- the **opencode plugins**: `opencode-rtk`, `context-mode`, `@tarquinen/opencode-dcp`
-- the **compaction context plugin** (`~/.config/opencode/plugins/compaction.ts`)
-  — injects a preservation checklist into native compaction summaries
-- the **cheap-route plugin** (`~/.config/opencode/plugins/cheap-route.ts`)
-  — virtual `cheap_route` provider that resolves logical model names to cheapest
-  direct vendor at session start (via `config` + `chat.message` hooks). Ranks
-  vendors from models.dev, sticky per session; `/cheap-route refresh` updates
-  with y/yes confirmation. See `config/plugins/cheap-route.ts`.
-- **`small_model`** set to `cheap-route/deepseek-v4-flash` in global
-  config — cheap model for title generation and other lightweight tasks
-- the **Superpowers agent pack** (`opencode-superpowers@latest` via `npx`)
-  — the superpowers **agent files** are deleted immediately after install;
-  only the bundled **skills** are kept (skills are invokable independently
-  from any primary agent via the `skill` tool)
-- **per-agent model/temperature/steps** set in global config — `plan` gets
-  `cheap-route/glm-5.2` (cheap model, low temp, 30-step cap),
-  `explore`/`scout` get `cheap-route/deepseek-v4-flash` with
-  15/20 step caps, `general` gets 25-step cap, `build` gets balanced
-  temperature
-- **OpenRouter timeouts + sort-by-price routing** — client timeouts
-  (`timeout` 120s, `headerTimeout` 15s, `chunkTimeout` 45s) plus per-model
-  `provider.sort: {by: price}` (z-ai/glm-5.2, deepseek/deepseek-v4-flash,
-moonshotai/kimi-k3, minimax/minimax-m3). No `order` list so OpenRouter sticky routing can pin
-   the session upstream (opencode sends `prompt_cache_key` / `X-Session-Id`).
-- **DCP context limit thresholds** — `compress.maxContextLimit` set to `"60%"`
-  and `minContextLimit` to `"30%"` of each model's context window in
-  `~/.config/opencode/dcp.jsonc` (percentage values adapt per model)
-
-- the **concise output rule** in `~/.config/opencode/AGENTS.md` — keeps
-  responses concise by default unless the user asks for more detail
-- the **rust-skills** and **golang-skills** opencode skill packs (cloned
-  into `~/.config/opencode/skills/`, default-branch aware)
-- the **ast-grep skill** — cloned from `ast-grep/agent-skill` into
-  `~/.config/opencode/skills/ast-grep/` (on-demand structural code search
-  via AST patterns; the `sg` binary is also installed)
-- **caveman / cavecrew cleanup** — removes JuliusBrussee/caveman artifacts
-  (plugin, skills, commands, agents) from the system on each install/update
-- a sanitize pass on `~/.opencode/opencode.json` to strip a known-bogus
-  `"list"` entry left by an older opencode bug
-
-### Prerequisites
-
-- Python 3.8+
-- `curl` or `wget`
-- `git`
-- `node` / `npx` (for the superpowers agent pack)
-- `opencode` on `PATH`
+- **rtk** binary at `~/.local/bin/rtk` (with `~/.local/bin` on `PATH`)
+- **ast-grep** binary (`sg`) at `~/.local/bin/sg` — force-installed from GitHub releases
+- **rtk** config in `~/.config/rtk/` and a `PreToolUse` hook in `~/.claude/settings.json`
+- **opencode plugins**: `opencode-rtk`, `context-mode`, `@tarquinen/opencode-dcp`
+- **compaction context plugin** (`~/.config/opencode/plugins/compaction.ts`)
+- **Superpowers agent pack** (`npx opencode-superpowers@latest`) — agent files deleted after install; skills kept
+- **per-agent temperature/steps** — `plan` (temp 0.1, 30 steps), `explore` (0.1, 15), `scout` (0.1, 20), `general` (25), `build` (0.2). Model keys are NOT set — use `configure-openrouter.py` or set them manually.
+- **DCP context limit thresholds** — `compress.maxContextLimit: "60%"`, `minContextLimit: "30%"`
+- **concise output rule** in `~/.config/opencode/AGENTS.md`
+- **rust-skills**, **golang-skills**, **ast-grep skill** — cloned into `~/.config/opencode/skills/`
+- **caveman / cavecrew cleanup** — deletes JuliusBrussee/caveman artifacts
+- sanitize pass on `~/.opencode/opencode.json` (strips bogus `"list"` entry)
 
 ### Usage
 
@@ -66,46 +25,62 @@ moonshotai/kimi-k3, minimax/minimax-m3). No `order` list so OpenRouter sticky ro
 ./install-opencode-plugins.py            # full install / update
 ./install-opencode-plugins.py --dry-run  # show what would happen
 ./install-opencode-plugins.py --help     # all flags
-./install-opencode-plugins.py -v         # verbose: log every exec
-
 ```
 
-### What it touches
+## `configure-openrouter.py`
+
+Separate, idempotent script for OpenRouter-specific settings:
+
+- **`small_model`** — sets `openrouter/deepseek/deepseek-v4-flash`
+- **agent model assignments** — `plan` → `openrouter/z-ai/glm-5.2`, `explore`/`scout` → `openrouter/deepseek/deepseek-v4-flash`
+- **OpenRouter timeouts + sort-by-price routing** — client timeouts (120s/15s/45s) plus per-model `provider.sort: {by: price}` on 4 models
+- removes legacy `update-openrouter-routing.py` cron entry
+
+### Usage
+
+```sh
+./configure-openrouter.py                          # full run
+./configure-openrouter.py --dry-run                # preview
+python configure-openrouter.py                     # also works
+```
+
+### Workflow
+
+```sh
+./install-opencode-plugins.py   # plugins, skills, binaries, generic config
+./configure-openrouter.py       # OpenRouter routing + model assignments
+```
+
+Either order works — `install-opencode-plugins.py` merges agent temp/steps without overwriting model keys.
+
+### What the main installer touches
 
 | path | action |
 | --- | --- |
 | `~/.local/bin/rtk` | installed |
-| `~/.local/bin/sg` | installed / force-upgraded from GitHub releases |
-| `~/.config/rtk/` | created; `RTK.md` relocated here from `$HOME` |
+| `~/.local/bin/sg` | installed / force-upgraded |
+| `~/.config/rtk/` | created; `RTK.md` relocated here |
 | `~/.claude/settings.json` | `PreToolUse` rtk hook installed (backed up) |
-| `~/.opencode/opencode.json` | sanitized; bogus `"list"` entry removed (backed up) |
-| `~/.config/opencode/opencode.jsonc` | plugin list updated (backed up) |
-| `~/.config/opencode/opencode.json` | small_model, agent config, OpenRouter timeouts + sort-by-price routing, compaction plugin entry (backed up) |
-| `~/.config/opencode/dcp.jsonc` | DCP compress limits (maxContextLimit=60%, minContextLimit=30%) (backed up) |
+| `~/.opencode/opencode.json` | sanitized (backed up) |
+| `~/.config/opencode/opencode.json` | agent config, compaction plugin entry (backed up) |
+| `~/.config/opencode/dcp.jsonc` | DCP compress limits (backed up) |
 | `~/.config/opencode/plugins/compaction.ts` | written / updated |
-| `~/.config/opencode/plugins/cheap-route.ts` | installed (virtual provider + vendor routing) |
-| `~/.cache/cheap-route/resolution.json` | vendor resolution cache (created on `/cheap-route refresh`) |
-| `~/.config/opencode/AGENTS.md` | concise output rule installed (backed up) |
-| `~/.config/opencode/agents/superpowers*.md` | installed then **deleted** (skills kept) |
+| `~/.config/opencode/AGENTS.md` | concise output rule (backed up) |
+| `~/.config/opencode/agents/superpowers*.md` | installed then deleted (skills kept) |
 | `~/.config/opencode/skills/rust-skills/` | cloned / updated |
 | `~/.config/opencode/skills/golang-skills/` | cloned / updated |
-| `~/.config/opencode/skills/ast-grep/` | cloned / updated (skill subtree) |
-| caveman/cavecrew artifacts | deleted (plugin, skills, commands, agents) |
-
-Backups are written alongside each file as `<name>.<TS>.bak`; the newest
-**5** are kept per target (older ones are deleted automatically).
+| `~/.config/opencode/skills/ast-grep/` | cloned / updated |
+| caveman/cavecrew artifacts | deleted |
 
 ### Security
 
-The installer pipes a remote shell script (`rtk`) from a pinned
-GitHub raw URL into a shell. The URL is declared as a constant near the
-top of the file — review it before running, or run `--dry-run` first
-to see exactly what commands would execute.
+The installer pipes a remote shell script (`rtk`) from a pinned GitHub raw URL into a shell. Review it before running, or run `--dry-run` first.
 
 ### Tests
 
 ```sh
-python -m unittest discover tests -v
+python -m pytest tests/ -v   # 65 tests (main installer + openrouter)
+npx tsx --test config/plugins/cheap-route.test.ts  # 35 TS tests
 ```
 
 Stdlib only; no test dependencies.

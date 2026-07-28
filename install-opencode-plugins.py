@@ -37,27 +37,6 @@ GLOBAL_CONFIG_JSONC = HOME / ".config/opencode/opencode.jsonc"
 AGENTS_DIR = HOME / ".config/opencode/agents"
 AGENTS_MD = HOME / ".config/opencode/AGENTS.md"
 
-SMALL_MODEL = "openrouter/deepseek/deepseek-v4-flash"
-
-# Client-side timeouts (opencode) — set at provider level (SDK options).
-OPENROUTER_PROVIDER_OPTIONS = {
-    "timeout": 120_000,       # full request (ms)
-    "headerTimeout": 15_000,  # wait for response headers (ms)
-    "chunkTimeout": 45_000,   # max gap between SSE chunks (ms)
-}
-
-# OpenRouter request-body routing — MUST be set per-model (provider-level is ignored).
-# sort-by-price disables load balancing; omit `order` so OpenRouter sticky routing works
-# (opencode already sends prompt_cache_key / X-Session-Id = session id).
-OPENROUTER_ROUTING = {"sort": {"by": "price"}}
-OPENROUTER_ROUTING_MODELS = [
-    "z-ai/glm-5.2",
-    "deepseek/deepseek-v4-flash",
-    "moonshotai/kimi-k3",
-    "minimax/minimax-m3",
-]
-OPENROUTER_CRON_MARKER = "ai-dev-openrouter-routing"  # legacy; removed on install
-
 # DCP plugin config — written to ~/.config/opencode/dcp.jsonc.
 # Percentage values adapt to each model's context window automatically.
 DCP_CONFIG = HOME / ".config" / "opencode" / "dcp.jsonc"
@@ -69,17 +48,14 @@ DCP_COMPRESS_LIMITS = {
 
 AGENT_CONFIG = {
     "plan": {
-        "model": "openrouter/z-ai/glm-5.2",
         "temperature": 0.1,
         "steps": 30,
     },
     "explore": {
-        "model": "openrouter/deepseek/deepseek-v4-flash",
         "temperature": 0.1,
         "steps": 15,
     },
     "scout": {
-        "model": "openrouter/deepseek/deepseek-v4-flash",
         "temperature": 0.1,
         "steps": 20,
     },
@@ -563,35 +539,8 @@ def install_cheap_route_plugin() -> None:
     log("installing cheap-route plugin — DISABLED (dev)"); return
 
 
-def configure_small_model() -> None:
-    log("configuring small_model for lightweight tasks")
-    cfg_path = global_config_path()
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(read_text(cfg_path))
-        except json.JSONDecodeError:
-            warn(f"{cfg_path} invalid JSON — cannot set small_model")
-            return
-    else:
-        cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
-
-    current = cfg.get("small_model")
-    if current == SMALL_MODEL:
-        print(f"  small_model already set to {SMALL_MODEL}")
-        return
-
-    old_val = f" (was: {current})" if current else ""
-    cfg["small_model"] = SMALL_MODEL
-    if not _dry_run:
-        if cfg_path.exists():
-            backup_with_rotation(cfg_path)
-        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
-        _touched.append(cfg_path)
-    print(f"  set small_model to {SMALL_MODEL}{old_val}")
-
-
 def configure_agent_optimizations() -> None:
-    log("configuring agent optimizations (models, steps, temperature)")
+    log("configuring agent optimizations (steps, temperature)")
     cfg_path = global_config_path()
     if cfg_path.exists():
         try:
@@ -602,96 +551,34 @@ def configure_agent_optimizations() -> None:
     else:
         cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
 
-    current = cfg.get("agent", {})
-    if current == AGENT_CONFIG:
-        print(f"  agent config already up to date")
+    current_agent = cfg.get("agent", {})
+    if not isinstance(current_agent, dict):
+        current_agent = {}
+
+    merged = dict(current_agent)
+    changed = False
+    for agent, settings in AGENT_CONFIG.items():
+        existing = merged.get(agent, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        updated = {**existing, **settings}
+        if updated != existing:
+            merged[agent] = updated
+            changed = True
+
+    if not changed:
+        print("  agent config already up to date")
         return
 
-    old_val = "" if not current else ""
-    cfg["agent"] = AGENT_CONFIG
+    cfg["agent"] = merged
     if not _dry_run:
         if cfg_path.exists():
             backup_with_rotation(cfg_path)
         atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
         _touched.append(cfg_path)
-    print(f"  set agent config{old_val}")
+    print("  set agent config")
 
 
-def configure_openrouter_routing() -> None:
-    """Set OpenRouter client timeouts + per-model sort-by-price routing."""
-    log("configuring OpenRouter timeouts + sort-by-price routing")
-    cfg_path = global_config_path()
-
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(read_text(cfg_path))
-        except json.JSONDecodeError:
-            warn(f"{cfg_path} invalid JSON — cannot configure OpenRouter")
-            return
-    else:
-        cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
-
-    providers = cfg.get("provider", {})
-    if not isinstance(providers, dict):
-        providers = {}
-    openrouter = providers.get("openrouter", {})
-    if not isinstance(openrouter, dict):
-        openrouter = {}
-
-    current_opts = openrouter.get("options", {})
-    if not isinstance(current_opts, dict):
-        current_opts = {}
-    # Drop legacy provider-level routing (ignored by opencode / AI SDK).
-    clean_opts = {k: v for k, v in current_opts.items() if k != "provider"}
-    merged_opts = {**clean_opts, **OPENROUTER_PROVIDER_OPTIONS}
-
-    current_models = openrouter.get("models", {})
-    if not isinstance(current_models, dict):
-        current_models = {}
-    new_models = dict(current_models)
-    for model_id in OPENROUTER_ROUTING_MODELS:
-        entry = new_models.get(model_id, {})
-        if not isinstance(entry, dict):
-            entry = {}
-        entry_opts = entry.get("options", {})
-        if not isinstance(entry_opts, dict):
-            entry_opts = {}
-        entry_opts = {**entry_opts, "provider": dict(OPENROUTER_ROUTING)}
-        new_models[model_id] = {**entry, "options": entry_opts}
-
-    timeouts_ok = (
-        all(current_opts.get(k) == v for k, v in OPENROUTER_PROVIDER_OPTIONS.items())
-        and "provider" not in current_opts
-    )
-    models_ok = all(
-        isinstance(new_models.get(mid), dict)
-        and isinstance(new_models[mid].get("options"), dict)
-        and new_models[mid]["options"].get("provider") == OPENROUTER_ROUTING
-        and isinstance(current_models.get(mid), dict)
-        and isinstance(current_models[mid].get("options"), dict)
-        and current_models[mid]["options"].get("provider") == OPENROUTER_ROUTING
-        for mid in OPENROUTER_ROUTING_MODELS
-    )
-    if timeouts_ok and models_ok:
-        print("  OpenRouter timeouts + sort-by-price already configured")
-        return
-
-    openrouter = {**openrouter, "options": merged_opts, "models": new_models}
-    providers = {**providers, "openrouter": openrouter}
-    cfg["provider"] = providers
-    if _dry_run:
-        print("  dry-run: would write OpenRouter timeouts + sort-by-price")
-        return
-    if cfg_path.exists():
-        backup_with_rotation(cfg_path)
-    atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
-    _touched.append(cfg_path)
-    print(
-        f"  set timeout={OPENROUTER_PROVIDER_OPTIONS['timeout']}ms "
-        f"headerTimeout={OPENROUTER_PROVIDER_OPTIONS['headerTimeout']}ms "
-        f"chunkTimeout={OPENROUTER_PROVIDER_OPTIONS['chunkTimeout']}ms"
-    )
-    print(f"  sort-by-price on {len(OPENROUTER_ROUTING_MODELS)} models (sticky-friendly)")
 
 
 def configure_dcp_limits() -> None:
@@ -738,45 +625,6 @@ def configure_dcp_limits() -> None:
         f"minContextLimit={DCP_COMPRESS_LIMITS['minContextLimit']}"
     )
 
-
-def remove_openrouter_routing_cron() -> None:
-    """Remove legacy hourly update-openrouter-routing.py crontab entry if present."""
-    log("removing legacy OpenRouter routing cron (if any)")
-    if not check_cmd("crontab"):
-        print("  crontab not found — skip")
-        return
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        print("  crontab not found — skip")
-        return
-    existing = result.stdout if result.returncode == 0 else ""
-    if OPENROUTER_CRON_MARKER not in existing:
-        print("  no legacy OpenRouter routing cron")
-        return
-    lines = [ln for ln in existing.splitlines() if OPENROUTER_CRON_MARKER not in ln]
-    while lines and not lines[-1].strip():
-        lines.pop()
-    new_table = ("\n".join(lines) + "\n") if lines else ""
-    if _dry_run:
-        print("  dry-run: would remove OpenRouter routing cron")
-        return
-    proc = subprocess.run(
-        ["crontab", "-"],
-        input=new_table,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        warn(f"crontab update failed: {proc.stderr.strip() or proc.returncode}")
-        return
-    print("  removed legacy OpenRouter routing cron")
 
 def install_superpowers() -> None:
     if not check_cmd("npx"):
@@ -989,23 +837,6 @@ def verify() -> None:
             print(f"  agent.explore.model: {explore_model}")
             has_compaction = COMPACTION_PLUGIN_ENTRY in cfg.get("plugin", [])
             print(f"  compaction plugin entry: {'yes' if has_compaction else 'MISSING'}")
-            # has_cheap_route = CHEAP_ROUTE_PLUGIN_ENTRY in cfg.get("plugin", [])
-            # print(f"  cheap-route plugin entry: {'yes' if has_cheap_route else 'MISSING'}")
-            provider_cfg = cfg.get("provider", {})
-            or_block = provider_cfg.get("openrouter", {})
-            or_opts = or_block.get("options", {}) if isinstance(or_block, dict) else {}
-            or_models = or_block.get("models", {}) if isinstance(or_block, dict) else {}
-            print(f"  openrouter timeout: {or_opts.get('timeout', 'not set')}")
-            print(f"  openrouter chunkTimeout: {or_opts.get('chunkTimeout', 'not set')}")
-            for mid in OPENROUTER_ROUTING_MODELS:
-                entry = or_models.get(mid, {}) if isinstance(or_models, dict) else {}
-                prov = (
-                    entry.get("options", {}).get("provider", "not set")
-                    if isinstance(entry, dict)
-                    else "not set"
-                )
-                short = mid.split("/")[-1]
-                print(f"  openrouter {short} routing: {prov}")
             dcp_cfg_path = DCP_CONFIG
             if dcp_cfg_path.exists():
                 try:
@@ -1140,12 +971,8 @@ def main(argv: list[str] | None = None) -> int:
         ("sanitize_local_config", sanitize_local_config),
         ("install_plugins", install_plugins),
         ("install_compaction_plugin", install_compaction_plugin),
-        # ("install_cheap_route_plugin", install_cheap_route_plugin),  # disabled for dev
-        ("configure_small_model", configure_small_model),
         ("configure_agent_optimizations", configure_agent_optimizations),
-        ("configure_openrouter_routing", configure_openrouter_routing),
         ("configure_dcp_limits", configure_dcp_limits),
-        ("remove_openrouter_routing_cron", remove_openrouter_routing_cron),
         ("install_superpowers", install_superpowers),
         ("remove_superpowers_agents", remove_superpowers_agents),
         ("remove_caveman_artifacts", remove_caveman_artifacts),
