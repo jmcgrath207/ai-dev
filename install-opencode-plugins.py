@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Install/update opencode plugins, rtk binary, and Superpowers agent pack.
+"""Install/update opencode plugins, rtk binary, Superpowers agent pack, and token-saving config.
 
 Idempotent single run. Backs up configs first. Stdlib only.
 
-SECURITY: This installer pipes remote shell scripts (`rtk`, `caveman`) from
-pinned GitHub raw URLs into a shell. URLs are declared as constants at the
-top of this file. Inspect them before running. A --no-verify flag exists for
-a dry-run, and --dry-run performs no mutation at all.
+SECURITY: This installer pipes a remote shell script (`rtk`) from a
+pinned GitHub raw URL into a shell. The URL is declared as a constant at
+the top of this file. Inspect it before running. A --no-verify flag
+exists for a dry-run, and --dry-run performs no mutation at all.
 """
 
 import argparse
 import json
 import os
-import re
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
+
+_HERE = Path(__file__).parent
+AGENTS_MD_SRC = _HERE / "config" / "AGENTS.md"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -28,8 +32,68 @@ HOME = Path.home()
 RTK_BIN_DIR = HOME / ".local/bin"
 RTK_BIN = RTK_BIN_DIR / "rtk"
 LOCAL_CONFIG = HOME / ".opencode/opencode.json"
-GLOBAL_CONFIG = HOME / ".config/opencode/opencode.jsonc"
+GLOBAL_CONFIG_JSON = HOME / ".config/opencode/opencode.json"
+GLOBAL_CONFIG_JSONC = HOME / ".config/opencode/opencode.jsonc"
 AGENTS_DIR = HOME / ".config/opencode/agents"
+AGENTS_MD = HOME / ".config/opencode/AGENTS.md"
+
+# DCP plugin config — written to ~/.config/opencode/dcp.jsonc.
+# Percentage values adapt to each model's context window automatically.
+DCP_CONFIG = HOME / ".config" / "opencode" / "dcp.jsonc"
+DCP_SCHEMA = "https://raw.githubusercontent.com/Opencode-DCP/opencode-dynamic-context-pruning/master/dcp.schema.json"
+DCP_COMPRESS_LIMITS = {
+    "maxContextLimit": "60%",
+    "minContextLimit": "30%",
+}
+
+AGENT_CONFIG = {
+    "plan": {
+        "temperature": 0.1,
+        "steps": 30,
+    },
+    "explore": {
+        "temperature": 0.1,
+        "steps": 15,
+    },
+    "scout": {
+        "temperature": 0.1,
+        "steps": 20,
+    },
+    "general": {
+        "steps": 25,
+    },
+    "build": {
+        "temperature": 0.2,
+    },
+}
+COMPACTION_PLUGIN = HOME / ".config/opencode/plugins/compaction.ts"
+COMPACTION_PLUGIN_ENTRY = "./plugins/compaction.ts"
+COMPACTION_PLUGIN_SRC = '''import type { Plugin } from "@opencode-ai/plugin"
+
+export const CompactionContextPlugin: Plugin = async () => {
+  return {
+    "experimental.session.compacting": async (_input, output) => {
+      output.context.push(`## Preserve across compaction
+- Active task + status
+- Key decisions made and why
+- Files currently being edited
+- Open blockers and next steps`)
+    },
+  }
+}
+'''
+
+# cheap-route plugin — DISABLED for dev (re-enable when ready to iterate).
+# CHEAP_ROUTE_PLUGIN_SRC = _HERE / "config" / "plugins" / "cheap-route.ts"
+# CHEAP_ROUTE_PLUGIN = HOME / ".config" / "opencode" / "plugins" / "cheap-route.ts"
+# CHEAP_ROUTE_PLUGIN_ENTRY = "./plugins/cheap-route.ts"
+# CHEAP_ROUTE_LIB_SRC = _HERE / "config" / "plugins" / "cheap-route-lib.ts"
+# CHEAP_ROUTE_LIB = HOME / ".config" / "opencode" / "plugins" / "cheap-route-lib.ts"
+
+AST_GREP_BIN = RTK_BIN_DIR / "sg"
+AST_GREP_SKILL_REPO = "https://github.com/ast-grep/agent-skill.git"
+AST_GREP_SKILL_CACHE = HOME / ".cache/ast-grep-skill-repo"
+AST_GREP_SKILL_DIR = HOME / ".config/opencode/skills/ast-grep"
 RTK_CONFIG_DIR = HOME / ".config/rtk"
 RTK_MD = HOME / "RTK.md"
 
@@ -42,11 +106,6 @@ PLUGINS = [
     "context-mode@latest",
     "@tarquinen/opencode-dcp@latest",
 ]
-
-CAVEMAN_INSTALL_URL = (
-    "https://raw.githubusercontent.com"
-    "/JuliusBrussee/caveman/main/install.sh"
-)
 
 RUST_SKILLS_REPO = "https://github.com/leonardomso/rust-skills.git"
 RUST_SKILLS_DIR = HOME / ".config/opencode/skills/rust-skills"
@@ -62,6 +121,15 @@ RTK_INSTALL_URL = (
 )
 
 BACKUP_KEEP = 5
+
+
+def global_config_path() -> Path:
+    """Resolve active global config: prefer .json over .jsonc."""
+    if GLOBAL_CONFIG_JSON.exists():
+        return GLOBAL_CONFIG_JSON
+    if GLOBAL_CONFIG_JSONC.exists():
+        return GLOBAL_CONFIG_JSONC
+    return GLOBAL_CONFIG_JSON  # default to .json format
 
 # ---------------------------------------------------------------------------
 # State
@@ -220,7 +288,7 @@ def default_branch(repo_dir: Path) -> str:
 
 def backup_configs() -> None:
     any_backup = False
-    for src in [LOCAL_CONFIG, GLOBAL_CONFIG]:
+    for src in [LOCAL_CONFIG, GLOBAL_CONFIG_JSON, GLOBAL_CONFIG_JSONC]:
         if not src.exists():
             continue
         dst = backup_with_rotation(src)
@@ -232,22 +300,16 @@ def backup_configs() -> None:
 
 
 def install_rtk_binary() -> None:
-    if shutil.which("rtk") or RTK_BIN.exists():
-        if _dry_run:
-            print("  rtk binary already installed (dry-run: skip version check)")
-            return
-        ver = subprocess.run(
-            ["rtk", "--version"], capture_output=True, text=True
-        )
-        print(
-            f"  rtk binary already installed: "
-            f"{ver.stdout.strip() or ver.stderr.strip()}"
-        )
-        return
     if not check_cmd("curl") and not check_cmd("wget"):
         err("curl and wget both missing on PATH")
         sys.exit(1)
-    log("installing rtk binary")
+    if shutil.which("rtk") or RTK_BIN.exists():
+        ver = subprocess.run(
+            ["rtk", "--version"], capture_output=True, text=True
+        )
+        log(f"force-upgrading rtk binary (currently {ver.stdout.strip() or ver.stderr.strip()})")
+    else:
+        log("installing rtk binary")
     if check_cmd("curl"):
         cmd = f"curl -fsSL {RTK_INSTALL_URL} | sh"
     else:
@@ -258,7 +320,87 @@ def install_rtk_binary() -> None:
     vlog(f"exec: {cmd}")
     subprocess.run(cmd, shell=True, check=True)
     _touched.append(RTK_BIN)
-    print(f"  installed: {RTK_BIN}")
+    print(f"  installed/upgraded: {RTK_BIN}")
+
+
+def _ast_grep_target_triple() -> str | None:
+    """Map platform to Rust target triple for ast-grep prebuilt binaries."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "linux":
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-unknown-linux-gnu"
+        if machine in ("aarch64", "arm64"):
+            return "aarch64-unknown-linux-gnu"
+    elif system == "darwin":
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-apple-darwin"
+        if machine in ("aarch64", "arm64"):
+            return "aarch64-apple-darwin"
+    return None
+
+
+def install_ast_grep_binary() -> None:
+    """Force-install ast-grep (sg) prebuilt binary from GitHub releases."""
+    triple = _ast_grep_target_triple()
+    if triple is None:
+        warn(f"unsupported platform: {platform.system()} {platform.machine()}")
+        return
+
+    if AST_GREP_BIN.exists():
+        ver = run(
+            [str(AST_GREP_BIN), "--version"], capture_output=True, text=True, check=False
+        )
+        log(f"force-upgrading ast-grep binary (currently {ver.stdout.strip() or ver.stderr.strip()})")
+    else:
+        log("installing ast-grep binary")
+
+    url = (
+        f"https://github.com/ast-grep/ast-grep/releases/latest/download/app-{triple}.zip"
+    )
+    downloader = None
+    if check_cmd("curl"):
+        downloader = "curl"
+    elif check_cmd("wget"):
+        downloader = "wget"
+    else:
+        err("curl and wget both missing on PATH")
+        sys.exit(1)
+
+    if _dry_run:
+        vlog(f"DRY-RUN: would download {url} and install to {AST_GREP_BIN}")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / "ast-grep.zip"
+        if downloader == "curl":
+            run(["curl", "-fsSL", "-o", str(zip_path), url])
+        else:
+            run(["wget", "-qO", str(zip_path), url])
+
+        extract_dir = Path(tmp) / "extracted"
+        extract_dir.mkdir()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+
+        # Copy all extracted files to ~/.local/bin/
+        # The zip contains both `sg` (wrapper) and `ast-grep` (real binary).
+        # zipfile.extractall does not preserve executable bits (mode 0o644),
+        # so chmod is applied after copy.
+        AST_GREP_BIN.parent.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for f in extract_dir.iterdir():
+            if not f.is_file():
+                continue
+            dest = AST_GREP_BIN.parent / f.name
+            shutil.copy2(f, dest)
+            dest.chmod(0o755)
+            _touched.append(dest)
+            copied += 1
+        if copied == 0:
+            err("no files found in ast-grep release zip")
+            sys.exit(1)
+    print(f"  installed/upgraded: {AST_GREP_BIN} (+ {copied - 1} companion file(s))")
 
 
 def rtk_init_opencode() -> None:
@@ -348,95 +490,247 @@ def install_plugins() -> None:
         run(["opencode", "plugin", spec, "--global", "--force"])
 
 
+def install_compaction_plugin() -> None:
+    log("installing compaction context plugin")
+    if COMPACTION_PLUGIN.exists():
+        existing = read_text(COMPACTION_PLUGIN)
+        if existing == COMPACTION_PLUGIN_SRC:
+            print(f"  {COMPACTION_PLUGIN} up to date")
+        else:
+            if not _dry_run:
+                atomic_write(COMPACTION_PLUGIN, COMPACTION_PLUGIN_SRC)
+                _touched.append(COMPACTION_PLUGIN)
+            print(f"  updated: {COMPACTION_PLUGIN}")
+    else:
+        if not _dry_run:
+            atomic_write(COMPACTION_PLUGIN, COMPACTION_PLUGIN_SRC)
+            _touched.append(COMPACTION_PLUGIN)
+        print(f"  wrote: {COMPACTION_PLUGIN}")
+
+    cfg_path = global_config_path()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(read_text(cfg_path))
+        except json.JSONDecodeError:
+            warn(f"{cfg_path} invalid JSON — cannot add compaction plugin entry")
+            return
+    else:
+        cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
+
+    if not isinstance(cfg, dict):
+        warn(f"{cfg_path} not a dict — cannot add compaction plugin entry")
+        return
+
+    plugins = cfg.get("plugin", [])
+    if COMPACTION_PLUGIN_ENTRY in plugins:
+        print(f"  plugin entry already in {cfg_path.name}")
+        return
+    plugins.insert(0, COMPACTION_PLUGIN_ENTRY)
+    cfg["plugin"] = plugins
+    if not _dry_run:
+        backup_with_rotation(cfg_path) if cfg_path.exists() else None
+        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+        _touched.append(cfg_path)
+    print(f"  added {COMPACTION_PLUGIN_ENTRY} to {cfg_path.name} plugin list")
+
+
+def install_cheap_route_plugin() -> None:
+    """Cheap-route plugin — DISABLED for dev iteration."""
+    log("installing cheap-route plugin — DISABLED (dev)"); return
+
+
+def configure_agent_optimizations() -> None:
+    log("configuring agent optimizations (steps, temperature)")
+    cfg_path = global_config_path()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(read_text(cfg_path))
+        except json.JSONDecodeError:
+            warn(f"{cfg_path} invalid JSON — cannot set agent config")
+            return
+    else:
+        cfg = {"$schema": "https://opencode.ai/config.json", "plugin": []}
+
+    current_agent = cfg.get("agent", {})
+    if not isinstance(current_agent, dict):
+        current_agent = {}
+
+    merged = dict(current_agent)
+    changed = False
+    for agent, settings in AGENT_CONFIG.items():
+        existing = merged.get(agent, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        updated = {**existing, **settings}
+        if updated != existing:
+            merged[agent] = updated
+            changed = True
+
+    if not changed:
+        print("  agent config already up to date")
+        return
+
+    cfg["agent"] = merged
+    if not _dry_run:
+        if cfg_path.exists():
+            backup_with_rotation(cfg_path)
+        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+        _touched.append(cfg_path)
+    print("  set agent config")
+
+
+
+
+def configure_dcp_limits() -> None:
+    """Set DCP context limit thresholds to match modern model context windows."""
+    log("configuring DCP compress limits")
+    cfg_path = DCP_CONFIG
+
+    if not cfg_path.exists():
+        cfg = {"$schema": DCP_SCHEMA}
+    else:
+        try:
+            cfg = json.loads(read_text(cfg_path))
+        except json.JSONDecodeError:
+            warn(f"{cfg_path} invalid JSON — cannot configure DCP limits")
+            return
+        if not isinstance(cfg, dict):
+            warn(f"{cfg_path} is not a JSON object — skip")
+            return
+
+    current_compress = cfg.get("compress", {})
+    if not isinstance(current_compress, dict):
+        current_compress = {}
+
+    if (
+        current_compress.get("maxContextLimit") == DCP_COMPRESS_LIMITS["maxContextLimit"]
+        and current_compress.get("minContextLimit") == DCP_COMPRESS_LIMITS["minContextLimit"]
+    ):
+        print("  DCP compress limits already configured")
+        return
+
+    # Preserve any existing keys, merge our limits
+    cfg["compress"] = {**current_compress, **DCP_COMPRESS_LIMITS}
+
+    if _dry_run:
+        print("  dry-run: would write DCP compress limits")
+        return
+
+    if cfg_path.exists():
+        backup_with_rotation(cfg_path)
+    atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+    _touched.append(cfg_path)
+    print(
+        f"  maxContextLimit={DCP_COMPRESS_LIMITS['maxContextLimit']} "
+        f"minContextLimit={DCP_COMPRESS_LIMITS['minContextLimit']}"
+    )
+
+
 def install_superpowers() -> None:
     if not check_cmd("npx"):
         err("npx not found on PATH")
         sys.exit(1)
-    log("force-updating superpowers agent pack")
+    log("force-updating superpowers agent pack (skills only — agents removed after)")
     run(["npx", "-y", "opencode-superpowers@latest", "--force"])
 
 
-def install_julius_caveman() -> None:
-    log("installing JuliusBrussee/caveman via shell script")
-    if not check_cmd("curl") and not check_cmd("wget"):
-        err("curl and wget both missing on PATH")
-        sys.exit(1)
-    if check_cmd("curl"):
-        cmd = f"curl -fsSL {CAVEMAN_INSTALL_URL} | bash -s -- --force --only opencode"
-    else:
-        cmd = f"wget -qO- {CAVEMAN_INSTALL_URL} | bash -s -- --force --only opencode"
-    if _dry_run:
-        vlog(f"DRY-RUN: would run: {cmd}")
-    else:
-        vlog(f"exec: {cmd}")
-        subprocess.run(cmd, shell=True, check=True)
-    _touched.append(HOME / ".config/opencode/plugins/caveman")
-    for a in [
-        "cavecrew-investigator.md",
-        "cavecrew-builder.md",
-        "cavecrew-reviewer.md",
-    ]:
-        p = AGENTS_DIR / a
-        if p.exists():
-            _touched.append(p)
+def remove_superpowers_agents() -> None:
+    """Delete superpowers agent .md files; keep superpowers skills."""
+    log("removing superpowers agents (keeping skills)")
+    if not AGENTS_DIR.exists():
+        print("  agents dir not found")
+        return
+    removed = 0
+    for f in sorted(AGENTS_DIR.glob("superpowers*.md")):
+        if _dry_run:
+            vlog(f"DRY-RUN: would delete {f}")
+        else:
+            f.unlink()
+            _touched.append(f)
+            print(f"  removed: {f.name}")
+            removed += 1
+    if not removed:
+        print("  no superpowers agents to remove (already clean)")
 
 
-_FRONTMATTER_MODEL_RE = re.compile(r"^model\s*:")
+def install_concise_agents_md() -> None:
+    log("installing concise output rule in AGENTS.md")
+    source = read_text(AGENTS_MD_SRC)
+    target = AGENTS_MD
+    if target.exists():
+        existing = read_text(target)
+        if existing == source:
+            print(f"  {target} up to date")
+            return
+        dst = backup_with_rotation(target)
+        if dst:
+            print(f"  backup: {target} -> {dst}")
+    if not _dry_run:
+        atomic_write(target, source)
+        _touched.append(target)
+    print(f"  wrote: {target}")
 
 
-def _strip_model_pins_in_dir(agents_dir: Path, glob_pat: str, label: str) -> int:
-    """Strip `model:` frontmatter lines from agent .md files matching glob.
+def remove_caveman_artifacts() -> None:
+    """Best-effort removal of JuliusBrussee/caveman leftovers."""
+    log("removing JuliusBrussee/caveman artifacts")
+    paths = [
+        HOME / ".config/opencode/plugins/caveman",
+        HOME / ".config/opencode/commands/caveman.md",
+        HOME / ".config/opencode/commands/caveman-commit.md",
+        HOME / ".config/opencode/commands/caveman-compress.md",
+        HOME / ".config/opencode/commands/caveman-help.md",
+        HOME / ".config/opencode/commands/caveman-review.md",
+        HOME / ".config/opencode/commands/caveman-stats.md",
+        HOME / ".config/opencode/skills/caveman",
+        HOME / ".config/opencode/skills/caveman-commit",
+        HOME / ".config/opencode/skills/caveman-compress",
+        HOME / ".config/opencode/skills/caveman-help",
+        HOME / ".config/opencode/skills/caveman-review",
+        HOME / ".config/opencode/skills/caveman-stats",
+        HOME / ".config/opencode/skills/cavecrew",
+        HOME / ".config/opencode/agents/cavecrew-investigator.md",
+        HOME / ".config/opencode/agents/cavecrew-builder.md",
+        HOME / ".config/opencode/agents/cavecrew-reviewer.md",
+        HOME / ".claude/.caveman-active",
+    ]
+    for p in paths:
+        if not p.exists():
+            continue
+        if _dry_run:
+            vlog(f"DRY-RUN: would delete {p}")
+        else:
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                _touched.append(p)
+                vlog(f"  removed: {p}")
+            except OSError as e:
+                vlog(f"  could not remove {p}: {e}")
 
-    Walks YAML frontmatter delimited by `---` fences. Strips any line in the
-    frontmatter starting with `model:` (with any amount of whitespace after
-    the colon). Returns the count of files modified.
-    """
-    if not agents_dir.exists():
-        return 0
-    stripped = 0
-    for f in sorted(agents_dir.glob(glob_pat)):
+    # Also remove plugin entry from opencode.json if present
+    cfg_path = global_config_path()
+    if cfg_path.exists():
         try:
-            text = read_text(f)
-        except OSError as e:
-            warn(f"could not read {f}: {e}")
-            continue
-        lines = text.split("\n")
-        if not lines or lines[0].strip() != "---":
-            continue
-        out = [lines[0]]
-        changed = False
-        in_fm = True
-        for line in lines[1:]:
-            if in_fm and line.strip() == "---":
-                in_fm = False
-                out.append(line)
-                continue
-            if in_fm and _FRONTMATTER_MODEL_RE.match(line):
-                changed = True
-                continue
-            out.append(line)
-        if changed:
-            if _dry_run:
-                vlog(f"DRY-RUN: would strip model pin: {f.name}")
-            else:
-                atomic_write(f, "\n".join(out))
-                print(f"  stripped model pin: {f.name}")
-            stripped += 1
-    if not stripped:
-        print(f"  no model pins found in {label} (already clean)")
-    return stripped
+            cfg = json.loads(read_text(cfg_path))
+        except (json.JSONDecodeError, OSError):
+            return
+        plugins = cfg.get("plugin", [])
+        entry = "./plugins/caveman/plugin.js"
+        if entry in plugins:
+            cfg["plugin"] = [p for p in plugins if p != entry]
+            if not _dry_run:
+                atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+                _touched.append(cfg_path)
+            print(f"  removed {entry} from {cfg_path.name}")
+        else:
+            print(f"  no caveman plugin entry in {cfg_path.name}")
+    else:
+        warn("no global opencode config — skipping caveman plugin entry removal")
 
-
-def strip_caveman_model_pins() -> None:
-    log("stripping model pins from cavecrew agents")
-    _strip_model_pins_in_dir(AGENTS_DIR, "cavecrew-*.md", "cavecrew agents")
-
-
-def strip_superpowers_model_pins() -> None:
-    """Strip model pins from all superpowers agents so opencode uses the
-    user-configured default model instead of the upstream's copilot pins."""
-    log("stripping model pins from superpowers agents")
-    _strip_model_pins_in_dir(AGENTS_DIR, "superpowers*.md", "superpowers agents")
+    print("  done")
 
 
 def _fetch_or_clone(repo: str, dest: Path, hint: str) -> None:
@@ -473,6 +767,26 @@ def install_golang_skills() -> None:
     _fetch_or_clone(GOLANG_SKILLS_REPO, GOLANG_SKILLS_DIR, hint="main")
 
 
+def install_ast_grep_skill() -> None:
+    """Clone ast-grep claude-skill repo and copy the skill subtree."""
+    if not check_cmd("git"):
+        err("git not found on PATH")
+        sys.exit(1)
+    log("installing ast-grep skill")
+    _fetch_or_clone(AST_GREP_SKILL_REPO, AST_GREP_SKILL_CACHE, hint="main")
+    src = AST_GREP_SKILL_CACHE / "ast-grep/skills/ast-grep"
+    if not src.exists():
+        err(f"expected skill subtree not found in cloned repo: {src}")
+        sys.exit(1)
+    if _dry_run:
+        vlog(f"DRY-RUN: would copy {src} -> {AST_GREP_SKILL_DIR}")
+        return
+    AST_GREP_SKILL_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, AST_GREP_SKILL_DIR, dirs_exist_ok=True)
+    _touched.append(AST_GREP_SKILL_DIR)
+    print(f"  installed: {AST_GREP_SKILL_DIR}")
+
+
 # ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
@@ -492,26 +806,74 @@ def verify() -> None:
     else:
         warn("rtk binary not found")
     print()
+    if shutil.which("sg") or AST_GREP_BIN.exists():
+        if _dry_run:
+            print("  ast-grep: would run --version (dry-run)")
+        else:
+            subprocess.run([str(AST_GREP_BIN), "--version"])
+    else:
+        warn("ast-grep binary (sg) not found")
+    print()
     if AGENTS_DIR.exists():
         agents = sorted(f.name for f in AGENTS_DIR.glob("*.md"))
+        n_superpowers = sum(1 for a in agents if "superpowers" in a)
         print(f"  agents ({len(agents)}): {agents}")
+        print(f"  superpowers agent files: {'present' if n_superpowers else 'GONE'}")
     else:
         print("  agents: (dir not found)")
     print()
-    if GLOBAL_CONFIG.exists():
+    cfg_path = global_config_path()
+    if cfg_path.exists():
         try:
-            cfg = json.loads(read_text(GLOBAL_CONFIG))
-            print(f"  global plugins: {cfg.get('plugin', [])}")
+            cfg = json.loads(read_text(cfg_path))
+            print(f"  global config: {cfg_path.name}")
+            print(f"  plugins: {cfg.get('plugin', [])}")
+            small = cfg.get("small_model", "not set")
+            print(f"  small_model: {small}")
+            agent_cfg = cfg.get("agent", {})
+            plan_model = agent_cfg.get("plan", {}).get("model", "not set")
+            explore_model = agent_cfg.get("explore", {}).get("model", "not set")
+            print(f"  agent.plan.model: {plan_model}")
+            print(f"  agent.explore.model: {explore_model}")
+            has_compaction = COMPACTION_PLUGIN_ENTRY in cfg.get("plugin", [])
+            print(f"  compaction plugin entry: {'yes' if has_compaction else 'MISSING'}")
+            dcp_cfg_path = DCP_CONFIG
+            if dcp_cfg_path.exists():
+                try:
+                    dcp_cfg = json.loads(read_text(dcp_cfg_path))
+                    dcp_compress = dcp_cfg.get("compress", {})
+                    if isinstance(dcp_compress, dict):
+                        print(f"  dcp maxContextLimit: {dcp_compress.get('maxContextLimit', 'not set')}")
+                        print(f"  dcp minContextLimit: {dcp_compress.get('minContextLimit', 'not set')}")
+                    else:
+                        print("  dcp compress: not an object")
+                except (json.JSONDecodeError, OSError):
+                    warn(f"could not read {dcp_cfg_path.name}")
+            else:
+                warn("dcp config not found")
         except (json.JSONDecodeError, OSError):
-            warn(f"could not read {GLOBAL_CONFIG}")
+            warn(f"could not read {cfg_path}")
     else:
         warn("no global opencode config")
-    print()
-    caveman_plugin = HOME / ".config/opencode/plugins/caveman/plugin.js"
-    if caveman_plugin.exists():
-        print("  JuliusBrussee/caveman plugin: installed")
+    if COMPACTION_PLUGIN.exists():
+        print(f"  compaction plugin file: {COMPACTION_PLUGIN.name}")
     else:
-        warn("JuliusBrussee/caveman plugin not found")
+        warn(f"compaction plugin file {COMPACTION_PLUGIN.name} not found")
+    print()
+    # cheap-route install disabled for dev
+    # if CHEAP_ROUTE_PLUGIN.exists():
+    #     print(f"  cheap-route plugin: installed ({CHEAP_ROUTE_PLUGIN.stat().st_size} bytes)")
+    # else:
+    #     warn("cheap-route plugin not found")
+    # if CHEAP_ROUTE_LIB.exists():
+    #     print(f"  cheap-route lib: installed ({CHEAP_ROUTE_LIB.stat().st_size} bytes)")
+    # else:
+    #     warn("cheap-route lib not found")
+    # print()
+    if AGENTS_MD.exists():
+        print(f"  AGENTS.md: installed ({AGENTS_MD.stat().st_size} bytes)")
+    else:
+        warn("AGENTS.md not found")
     print()
     if RUST_SKILLS_DIR.exists():
         n_files = sum(1 for f in RUST_SKILLS_DIR.rglob("*") if f.is_file())
@@ -525,6 +887,12 @@ def verify() -> None:
         print(f"  golang-skills: installed ({n_files} files, {skill_count} skills)")
     else:
         warn("golang-skills not found")
+    print()
+    ast_grep_skill_md = AST_GREP_SKILL_DIR / "SKILL.md"
+    if ast_grep_skill_md.exists():
+        print(f"  ast-grep skill: installed ({ast_grep_skill_md.stat().st_size} bytes)")
+    else:
+        warn("ast-grep skill not found")
     print()
     if CLAUDE_SETTINGS.exists():
         try:
@@ -597,16 +965,21 @@ def main(argv: list[str] | None = None) -> int:
     steps = [
         ("backup_configs", backup_configs),
         ("install_rtk_binary", install_rtk_binary),
+        ("install_ast_grep_binary", install_ast_grep_binary),
         ("rtk_init_opencode", rtk_init_opencode),
         ("install_rtk_hook", install_rtk_hook),
         ("sanitize_local_config", sanitize_local_config),
         ("install_plugins", install_plugins),
+        ("install_compaction_plugin", install_compaction_plugin),
+        ("configure_agent_optimizations", configure_agent_optimizations),
+        ("configure_dcp_limits", configure_dcp_limits),
         ("install_superpowers", install_superpowers),
-        ("strip_superpowers_model_pins", strip_superpowers_model_pins),
-        ("install_julius_caveman", install_julius_caveman),
-        ("strip_caveman_model_pins", strip_caveman_model_pins),
+        ("remove_superpowers_agents", remove_superpowers_agents),
+        ("remove_caveman_artifacts", remove_caveman_artifacts),
+        ("install_concise_agents_md", install_concise_agents_md),
         ("install_rust_skills", install_rust_skills),
         ("install_golang_skills", install_golang_skills),
+        ("install_ast_grep_skill", install_ast_grep_skill),
         ("sanitize_local_config (2nd pass)", sanitize_local_config),
     ]
 
